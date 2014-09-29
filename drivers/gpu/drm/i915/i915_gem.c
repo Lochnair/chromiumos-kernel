@@ -3090,6 +3090,9 @@ i915_gem_wait_ioctl(struct drm_device *dev, void *data, struct drm_file *file)
 	if (args->flags != 0)
 		return -EINVAL;
 
+	if (args->flags != 0)
+		return -EINVAL;
+
 	ret = i915_mutex_lock_interruptible(dev);
 	if (ret)
 		return ret;
