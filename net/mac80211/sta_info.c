@@ -1739,6 +1739,13 @@ void sta_set_sinfo(struct sta_info *sta, struct station_info *sinfo)
 
 	sinfo->generation = sdata->local->sta_generation;
 
+	/* do before driver, so beacon filtering drivers have a
+	 * chance to e.g. just add the number of filtered beacons
+	 * (or just modify the value entirely, of course)
+	 */
+	if (sdata->vif.type == NL80211_IFTYPE_STATION)
+		sinfo->rx_beacon = sdata->u.mgd.count_beacon_signal;
+
 	sinfo->filled = STATION_INFO_INACTIVE_TIME |
 			STATION_INFO_RX_BYTES64 |
 			STATION_INFO_TX_BYTES64 |
@@ -1770,6 +1777,13 @@ void sta_set_sinfo(struct sta_info *sta, struct station_info *sinfo)
 	sinfo->tx_failed = sta->tx_retry_failed;
 	sinfo->rx_dropped_misc = sta->rx_dropped;
 	sinfo->beacon_loss_count = sta->beacon_loss_count;
+
+	if (sdata->vif.type == NL80211_IFTYPE_STATION &&
+	    !(sdata->vif.driver_flags & IEEE80211_VIF_BEACON_FILTER)) {
+		sinfo->filled |= BIT(NL80211_STA_INFO_BEACON_RX) |
+				 BIT(NL80211_STA_INFO_BEACON_SIGNAL_AVG);
+		sinfo->rx_beacon_signal_avg = ieee80211_ave_rssi(&sdata->vif);
+	}
 
 	if ((sta->local->hw.flags & IEEE80211_HW_SIGNAL_DBM) ||
 	    (sta->local->hw.flags & IEEE80211_HW_SIGNAL_UNSPEC)) {
