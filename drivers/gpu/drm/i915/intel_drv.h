@@ -1365,7 +1365,7 @@ void intel_hpd_poll_init(struct drm_i915_private *dev_priv);
 
 
 /* legacy fbdev emulation in intel_fbdev.c */
-#ifdef CONFIG_DRM_I915_FBDEV
+#ifdef CONFIG_DRM_FBDEV_EMULATION
 extern int intel_fbdev_init(struct drm_device *dev);
 extern void intel_fbdev_initial_config(void *data, async_cookie_t cookie);
 extern void intel_fbdev_fini(struct drm_device *dev);
