@@ -1551,10 +1551,6 @@ static int sfe_ipv6_recv_tcp(struct sfe_ipv6 *si, struct sk_buff *skb, struct ne
 	 */
 	cm = sfe_ipv6_find_connection_match(si, dev, IPPROTO_TCP, src_ip, src_port, dest_ip, dest_port);
 	if (unlikely(!cm)) {
-		if (IS_ENABLED(CONFIG_NET_SCH_ARL) && (flags & TCP_FLAG_ACK))
-			arl_latency_sample_ingress_v6(skb,
-						      (struct ipv6hdr *)iph,
-						      (struct tcphdr *)tcph);
 		/*
 		 * We didn't get a connection but as TCP is connection-oriented that
 		 * may be because this is a non-fast connection (not running established).
@@ -1826,10 +1822,6 @@ static int sfe_ipv6_recv_tcp(struct sfe_ipv6 *si, struct sk_buff *skb, struct ne
 			counter_cm->protocol_state.tcp.max_end = max_end;
 		}
 	}
-
-	if (IS_ENABLED(CONFIG_NET_SCH_ARL) && (flags & TCP_FLAG_ACK))
-		arl_latency_sample_ingress_v6(skb, (struct ipv6hdr *)iph,
-					      (struct tcphdr *)tcph);
 
 	/*
 	 * From this point on we're good to modify the packet.

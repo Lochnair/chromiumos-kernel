@@ -259,8 +259,3 @@ static inline int sfe_addr_equal(sfe_ip_addr_t *a,
 {
 	return is_v4 ? sfe_ipv4_addr_equal(a->ip, b->ip) : sfe_ipv6_addr_equal(a->ip6, b->ip6);
 }
-
-void arl_latency_sample_ingress_v4(struct sk_buff *skb, struct iphdr *iph,
-				   struct tcphdr *tcph);
-void arl_latency_sample_ingress_v6(struct sk_buff *skb, struct ipv6hdr *iph,
-				   struct tcphdr *tcph);

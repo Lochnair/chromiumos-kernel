@@ -1518,12 +1518,6 @@ static int sfe_ipv4_recv_tcp(struct sfe_ipv4 *si, struct sk_buff *skb, struct ne
 	 */
 	cm = sfe_ipv4_find_sfe_ipv4_connection_match(si, dev, IPPROTO_TCP, src_ip, src_port, dest_ip, dest_port);
 	if (unlikely(!cm)) {
-		if ((IS_ENABLED(CONFIG_NET_SCH_ARL)) &&
-		    (flags & TCP_FLAG_ACK)) {
-			arl_latency_sample_ingress_v4(skb,
-						      (struct iphdr *)iph,
-						      (struct tcphdr *)tcph);
-		}
 		/*
 		 * We didn't get a connection but as TCP is connection-oriented that
 		 * may be because this is a non-fast connection (not running established).
@@ -1794,15 +1788,6 @@ static int sfe_ipv4_recv_tcp(struct sfe_ipv4 *si, struct sk_buff *skb, struct ne
 		if (likely((s32)(max_end - counter_cm->protocol_state.tcp.max_end) >= 0)) {
 			counter_cm->protocol_state.tcp.max_end = max_end;
 		}
-	}
-
-	if (IS_ENABLED(CONFIG_NET_SCH_ARL)) {
-		/* ARL hook for WAN->LAN TCP traffic */
-		if ((cm->flags &
-		    SFE_IPV4_CONNECTION_MATCH_FLAG_XLATE_DEST) &&
-		    (flags & TCP_FLAG_ACK))
-			arl_latency_sample_ingress_v4(skb, (struct iphdr *)iph,
-						      (struct tcphdr *)tcph);
 	}
 
 	/*
