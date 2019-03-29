@@ -128,9 +128,9 @@ static struct vb2_buffer *get_display_buffer(struct mtk_vcodec_ctx *ctx)
 	mutex_lock(&ctx->lock);
 	if (dstbuf->used) {
 		vb2_set_plane_payload(&dstbuf->vb.vb2_buf, 0,
-					ctx->picinfo.y_bs_sz);
+					ctx->picinfo.fb_sz[0]);
 		vb2_set_plane_payload(&dstbuf->vb.vb2_buf, 1,
-					ctx->picinfo.c_bs_sz);
+					ctx->picinfo.fb_sz[1]);
 
 		dstbuf->ready_to_display = true;
 
@@ -275,6 +275,27 @@ static void mtk_vdec_flush_decoder(struct mtk_vcodec_ctx *ctx)
 	clean_free_buffer(ctx);
 }
 
+static void mtk_vdec_update_fmt(struct mtk_vcodec_ctx *ctx,
+				unsigned int pixelformat)
+{
+	struct mtk_video_fmt *fmt;
+	struct mtk_q_data *dst_q_data;
+	unsigned int k;
+
+	dst_q_data = &ctx->q_data[MTK_Q_DATA_DST];
+	for (k = 0; k < NUM_FORMATS; k++) {
+		fmt = &mtk_video_formats[k];
+		if (fmt->fourcc == pixelformat) {
+			mtk_v4l2_debug(1, "Update cap fourcc(%d -> %d)",
+				dst_q_data->fmt.fourcc, pixelformat);
+			dst_q_data->fmt = fmt;
+			return;
+		}
+	}
+
+	mtk_v4l2_err("Cannot get fourcc(%d), using init value", pixelformat);
+}
+
 static void mtk_vdec_pic_info_update(struct mtk_vcodec_ctx *ctx)
 {
 	unsigned int dpbsize = 0;
@@ -295,6 +316,10 @@ static void mtk_vdec_pic_info_update(struct mtk_vcodec_ctx *ctx)
 		mtk_v4l2_err("Cannot get correct pic info");
 		return;
 	}
+
+	if (ctx->last_decoded_picinfo.cap_fourcc != ctx->picinfo.cap_fourcc &&
+		ctx->picinfo.cap_fourcc != 0)
+		mtk_vdec_update_fmt(ctx, ctx->picinfo.cap_fourcc);
 
 	if ((ctx->last_decoded_picinfo.pic_w == ctx->picinfo.pic_w) ||
 	    (ctx->last_decoded_picinfo.pic_h == ctx->picinfo.pic_h))
@@ -351,11 +376,11 @@ static void mtk_vdec_worker(struct work_struct *work)
 	pfb = &dst_buf_info->frame_buffer;
 	pfb->base_y.va = vb2_plane_vaddr(dst_buf, 0);
 	pfb->base_y.dma_addr = vb2_dma_contig_plane_dma_addr(dst_buf, 0);
-	pfb->base_y.size = ctx->picinfo.y_bs_sz + ctx->picinfo.y_len_sz;
+	pfb->base_y.size = ctx->picinfo.fb_sz[0];
 
 	pfb->base_c.va = vb2_plane_vaddr(dst_buf, 1);
 	pfb->base_c.dma_addr = vb2_dma_contig_plane_dma_addr(dst_buf, 1);
-	pfb->base_c.size = ctx->picinfo.c_bs_sz + ctx->picinfo.c_len_sz;
+	pfb->base_c.size = ctx->picinfo.fb_sz[1];
 	pfb->status = 0;
 	mtk_v4l2_debug(3, "===>[%d] vdec_if_decode() ===>", ctx->id);
 	mtk_v4l2_debug(3,
@@ -859,14 +884,13 @@ static int vidioc_vdec_g_fmt(struct file *file, void *priv,
 		 * So we just return picinfo yet, and update picinfo in
 		 * stop_streaming hook function
 		 */
-		q_data->sizeimage[0] = ctx->picinfo.y_bs_sz +
-					ctx->picinfo.y_len_sz;
-		q_data->sizeimage[1] = ctx->picinfo.c_bs_sz +
-					ctx->picinfo.c_len_sz;
+		q_data->sizeimage[0] = ctx->picinfo.fb_sz[0];
+		q_data->sizeimage[1] = ctx->picinfo.fb_sz[1];
 		q_data->bytesperline[0] = ctx->last_decoded_picinfo.buf_w;
 		q_data->bytesperline[1] = ctx->last_decoded_picinfo.buf_w;
 		q_data->coded_width = ctx->picinfo.buf_w;
 		q_data->coded_height = ctx->picinfo.buf_h;
+		ctx->last_decoded_picinfo.cap_fourcc = q_data->fmt->fourcc;
 
 		/*
 		 * Width and height are set to the dimensions
@@ -1001,6 +1025,8 @@ static void vb2ops_vdec_buf_queue(struct vb2_buffer *vb)
 	struct mtk_vcodec_ctx *ctx = vb2_get_drv_priv(vb->vb2_queue);
 	struct vb2_v4l2_buffer *vb2_v4l2 = NULL;
 	struct mtk_video_dec_buf *buf = NULL;
+	struct mtk_q_data *dst_q_data;
+	unsigned int i = 0;
 
 	mtk_v4l2_debug(3, "[%d] (%d) id=%d, vb=%p",
 			ctx->id, vb->vb2_queue->type,
@@ -1078,22 +1104,19 @@ static void vb2ops_vdec_buf_queue(struct vb2_buffer *vb)
 			}
 
 			ctx->last_decoded_picinfo = ctx->picinfo;
-			ctx->q_data[MTK_Q_DATA_DST].sizeimage[0] =
-						ctx->picinfo.y_bs_sz +
-						ctx->picinfo.y_len_sz;
-			ctx->q_data[MTK_Q_DATA_DST].bytesperline[0] =
-						ctx->picinfo.buf_w;
-			ctx->q_data[MTK_Q_DATA_DST].sizeimage[1] =
-						ctx->picinfo.c_bs_sz +
-						ctx->picinfo.c_len_sz;
-			ctx->q_data[MTK_Q_DATA_DST].bytesperline[1] =
-						ctx->picinfo.buf_w;
+			dst_q_data = &ctx->q_data[MTK_Q_DATA_DST];
+			for (i = 0; i < dst_q_data->fmt->num_planes; i++) {
+				dst_q_data->sizeimage[i] =
+					ctx->picinfo.fb_sz[i];
+				dst_q_data->bytesperline[i] =
+					ctx->picinfo.buf_w;
+			}
 			mtk_v4l2_debug(2, "[%d] vdec_if_init() OK wxh=%dx%d pic wxh=%dx%d sz[0]=0x%x sz[1]=0x%x",
 				ctx->id,
 				ctx->picinfo.buf_w, ctx->picinfo.buf_h,
 				ctx->picinfo.pic_w, ctx->picinfo.pic_h,
-				ctx->q_data[MTK_Q_DATA_DST].sizeimage[0],
-				ctx->q_data[MTK_Q_DATA_DST].sizeimage[1]);
+				dst_q_data->sizeimage[0],
+				dst_q_data->sizeimage[1]);
 
 			ret = vdec_if_get_param(ctx, GET_PARAM_DPB_SIZE,
 						&dpbsize);
