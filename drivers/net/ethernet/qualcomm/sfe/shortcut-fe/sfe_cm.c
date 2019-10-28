@@ -441,6 +441,18 @@ static unsigned int sfe_cm_post_routing(struct sk_buff *skb, int is_v4)
 	} else {
 		u32 dscp;
 
+		/* Do not create a flow based on an ICMP packet
+		 * containing an embedded "error packet".
+		 * TODO(mitzel): Determine whether it's needed to check for
+		 * and skip over IPv6 extension headers before ICMP error.
+		 */
+		if (ipv6_hdr(skb)->nexthdr == IPPROTO_ICMPV6 &&
+		    ipv6_hdr(skb)->nexthdr != sic.protocol) {
+			sfe_cm_incr_exceptions(SFE_CM_EXCEPTION_UNKNOW_PROTOCOL);
+			DEBUG_TRACE("CT flow encapsulated in ICMPv6 error payload\n");
+			return NF_ACCEPT;
+		}
+
 		sic.src_ip.ip6[0] = *((struct sfe_ipv6_addr *)&orig_tuple.src.u3.in6);
 		sic.dest_ip.ip6[0] = *((struct sfe_ipv6_addr *)&orig_tuple.dst.u3.in6);
 
