@@ -87,7 +87,9 @@ static void mtk_mdp_wdt_worker(struct work_struct *work)
 
 	list_for_each_entry(ctx, &mdp->ctx_list, list) {
 		mtk_mdp_dbg(0, "[%d] Change as state error", ctx->id);
-		mtk_mdp_ctx_state_lock_set(ctx, MTK_MDP_CTX_ERROR);
+		mutex_lock(&ctx->slock);
+		ctx->state |= MTK_MDP_CTX_ERROR;
+		mutex_unlock(&ctx->slock);
 	}
 }
 
