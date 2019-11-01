@@ -7,7 +7,7 @@
 #include <linux/linkage.h>
 #include <asm/ptrace.h>
 #include <asm/ftrace.h>
-
+#include <asm/nospec-branch.h>
 
 	.code64
 	.section .entry.text, "ax"
@@ -175,7 +175,8 @@ trace:
 #endif
 	subq $MCOUNT_INSN_SIZE, %rdi
 
-	call   *ftrace_trace_function
+	movq ftrace_trace_function, %r8
+	CALL_NOSPEC %r8
 
 	MCOUNT_RESTORE_FRAME
 
@@ -219,5 +220,5 @@ GLOBAL(return_to_handler)
 	movq 8(%rsp), %rdx
 	movq (%rsp), %rax
 	addq $24, %rsp
-	jmp *%rdi
+	JMP_NOSPEC %rdi
 #endif

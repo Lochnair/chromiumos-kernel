@@ -17,9 +17,18 @@ GZFLAGS		:=-9
 
 LIBGCC 		:= $(shell $(CC) $(KBUILD_CFLAGS) -print-libgcc-file-name)
 
+ifeq ($(CONFIG_ARM64_ERRATUM_843419),y)
+  ifeq ($(call ld-option, --fix-cortex-a53-843419),)
+$(warning ld does not support --fix-cortex-a53-843419; kernel may be susceptible to erratum)
+  else
+LDFLAGS_vmlinux	+= --fix-cortex-a53-843419
+  endif
+endif
+
 KBUILD_DEFCONFIG := defconfig
 
 KBUILD_CFLAGS	+= -mgeneral-regs-only
+KBUILD_CFLAGS	+= $(call cc-option, -mpc-relative-literal-loads)
 KBUILD_CFLAGS	+= -fno-pic
 ifeq ($(CONFIG_CPU_BIG_ENDIAN), y)
 KBUILD_CPPFLAGS	+= -mbig-endian
@@ -34,7 +43,7 @@ endif
 CHECKFLAGS	+= -D__aarch64__
 
 ifeq ($(CONFIG_ARM64_ERRATUM_843419), y)
-CFLAGS_MODULE	+= -mcmodel=large
+KBUILD_CFLAGS_MODULE	+= -mcmodel=large
 endif
 
 # Default value

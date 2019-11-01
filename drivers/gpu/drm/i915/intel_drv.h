@@ -790,14 +790,6 @@ enum link_m_n_set {
 	M2_N2
 };
 
-struct intel_dp_desc {
-	u8 oui[3];
-	u8 device_id[6];
-	u8 hw_rev;
-	u8 sw_major_rev;
-	u8 sw_minor_rev;
-} __packed;
-
 struct intel_dp_compliance_data {
 	unsigned long edid;
 };
@@ -835,7 +827,7 @@ struct intel_dp {
 	/* Max link BW for the sink as per DPCD registers */
 	int max_sink_link_bw;
 	/* sink or branch descriptor */
-	struct intel_dp_desc desc;
+	struct drm_dp_desc desc;
 	struct drm_dp_aux aux;
 	uint8_t train_set[4];
 	int panel_power_up_delay;
@@ -1284,7 +1276,6 @@ enum intel_display_power_domain
 intel_display_port_aux_power_domain(struct intel_encoder *intel_encoder);
 void intel_mode_from_pipe_config(struct drm_display_mode *mode,
 				 struct intel_crtc_state *pipe_config);
-void intel_modeset_preclose(struct drm_device *dev, struct drm_file *file);
 
 int skl_update_scaler_crtc(struct intel_crtc_state *crtc_state);
 int skl_max_scale(struct intel_crtc *crtc, struct intel_crtc_state *crtc_state);
@@ -1339,6 +1330,8 @@ void intel_edp_drrs_disable(struct intel_dp *intel_dp);
 void intel_edp_drrs_invalidate(struct drm_device *dev,
 		unsigned frontbuffer_bits);
 void intel_edp_drrs_flush(struct drm_device *dev, unsigned frontbuffer_bits);
+bool intel_digital_port_connected(struct drm_i915_private *dev_priv,
+					 struct intel_digital_port *port);
 
 void
 intel_dp_program_link_training_pattern(struct intel_dp *intel_dp,

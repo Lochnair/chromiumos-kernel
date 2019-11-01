@@ -253,7 +253,7 @@ static void gem_unmap_work(struct work_struct *__work)
 	struct drm_device *dev = nvbo->gem.dev;
 	struct reservation_object *resv = nvbo->bo.resv;
 	struct reservation_object_list *fobj;
-	struct fence *fence = NULL;
+	struct dma_fence *fence = NULL;
 	int ret;
 
 	ret = pm_runtime_get_sync(dev->dev);
@@ -1293,7 +1293,7 @@ nouveau_gem_ioctl_pushbuf_2(struct drm_device *dev, void *data,
 	struct nouveau_channel *chan = NULL;
 	struct sync_fence *input_fence = NULL;
 	struct nouveau_fence *fence = NULL;
-	struct fence *f = NULL;
+	struct dma_fence *f = NULL;
 	uint32_t *push = NULL;
 	struct nouveau_pushbuf_data *pb_data = NULL;
 	int ret = 0;
@@ -1376,12 +1376,12 @@ nouveau_gem_ioctl_pushbuf_2(struct drm_device *dev, void *data,
 	nouveau_fence_init(fence, chan);
 
 	if (req->flags & NOUVEAU_GEM_PUSHBUF_2_FENCE_EMIT) {
-		f = fence_get(&fence->base);
+		f = dma_fence_get(&fence->base);
 		ret = nouveau_fence_install(f, "nv-pushbuf", &req->fence);
 
 		if (ret) {
 			NV_PRINTK(error, cli, "fence install: %d\n", ret);
-			fence_put(f);
+			dma_fence_put(f);
 			goto out_fence;
 		}
 	}
@@ -1418,7 +1418,7 @@ nouveau_gem_ioctl_pushbuf_2(struct drm_device *dev, void *data,
 
 out_recovery:
 	if (f)
-		fence_signal(&fence->base);
+		dma_fence_signal(&fence->base);
 out_fence:
 	nouveau_fence_unref(&fence);
 out_input_fence:

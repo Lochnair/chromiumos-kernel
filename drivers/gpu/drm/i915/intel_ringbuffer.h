@@ -93,6 +93,7 @@ struct intel_ring_hangcheck {
 	int score;
 	enum intel_ring_hangcheck_action action;
 	int deadlock;
+	u32 instdone[I915_NUM_INSTDONE_REG];
 };
 
 struct intel_ringbuffer {
@@ -377,6 +378,13 @@ intel_ring_sync_index(struct intel_engine_cs *ring,
 	return idx;
 }
 
+static inline void
+intel_flush_status_page(struct intel_engine_cs *ring, int reg)
+{
+	drm_clflush_virt_range(&ring->status_page.page_addr[reg],
+			       sizeof(uint32_t));
+}
+
 static inline u32
 intel_read_status_page(struct intel_engine_cs *ring,
 		       int reg)
@@ -410,15 +418,16 @@ intel_write_status_page(struct intel_engine_cs *ring,
  * The area from dword 0x30 to 0x3ff is available for driver usage.
  */
 #define I915_GEM_HWS_INDEX		0x30
+#define I915_GEM_HWS_INDEX_ADDR (I915_GEM_HWS_INDEX << MI_STORE_DWORD_INDEX_SHIFT)
 #define I915_GEM_HWS_SCRATCH_INDEX	0x40
 #define I915_GEM_HWS_SCRATCH_ADDR (I915_GEM_HWS_SCRATCH_INDEX << MI_STORE_DWORD_INDEX_SHIFT)
 
-void intel_unpin_ringbuffer_obj(struct intel_ringbuffer *ringbuf);
+struct intel_ringbuffer *
+intel_engine_create_ringbuffer(struct intel_engine_cs *engine, int size);
 int intel_pin_and_map_ringbuffer_obj(struct drm_device *dev,
 				     struct intel_ringbuffer *ringbuf);
-void intel_destroy_ringbuffer_obj(struct intel_ringbuffer *ringbuf);
-int intel_alloc_ringbuffer_obj(struct drm_device *dev,
-			       struct intel_ringbuffer *ringbuf);
+void intel_unpin_ringbuffer_obj(struct intel_ringbuffer *ringbuf);
+void intel_ringbuffer_free(struct intel_ringbuffer *ring);
 
 void intel_stop_ring_buffer(struct intel_engine_cs *ring);
 void intel_cleanup_ring_buffer(struct intel_engine_cs *ring);
@@ -475,6 +484,11 @@ static inline u32 intel_ring_get_tail(struct intel_ringbuffer *ringbuf)
  * has been rounded up to 160 words.
  */
 #define MIN_SPACE_FOR_ADD_REQUEST	160
+
+static inline u32 intel_hws_seqno_address(struct intel_engine_cs *engine)
+{
+       return engine->status_page.gfx_addr + I915_GEM_HWS_INDEX_ADDR;
+}
 
 /*
  * Reserve space in the ring to guarantee that the i915_add_request() call

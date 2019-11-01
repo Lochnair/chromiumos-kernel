@@ -44,6 +44,8 @@ static bool intel_dp_mst_compute_config(struct intel_encoder *encoder,
 	struct intel_connector *connector, *found = NULL;
 	struct drm_connector_state *connector_state;
 	int mst_pbn;
+	bool reduce_m_n = drm_dp_has_quirk(&intel_dp->desc,
+					   DP_DPCD_QUIRK_LIMITED_M_N);
 
 	pipe_config->dp_encoder_is_mst = true;
 	pipe_config->has_pch_encoder = false;
@@ -84,7 +86,8 @@ static bool intel_dp_mst_compute_config(struct intel_encoder *encoder,
 	intel_link_compute_m_n(bpp, lane_count,
 			       adjusted_mode->crtc_clock,
 			       pipe_config->port_clock,
-			       &pipe_config->dp_m_n);
+			       &pipe_config->dp_m_n,
+			       reduce_m_n);
 
 	pipe_config->dp_m_n.tu = slots;
 

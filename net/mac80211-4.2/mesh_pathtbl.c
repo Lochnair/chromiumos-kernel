@@ -865,8 +865,8 @@ void mesh_plink_broken(struct sta_info *sta)
 	}
 	rcu_read_unlock();
 	if (paths_deactivated > 0)
-		mpath_dbg(sta->sdata, "MESH MPL the link to %pM is broken and %d path deactivated\n",
-			  sta->addr, paths_deactivated);
+		sdata_info(sta->sdata, "MESH MPL the link to %pM is broken and %d path deactivated\n",
+			   sta->addr, paths_deactivated);
 }
 
 static void mesh_path_node_reclaim(struct rcu_head *rp)

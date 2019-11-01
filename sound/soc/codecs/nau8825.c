@@ -815,11 +815,12 @@ static void nau8825_xtalk_work(struct work_struct *work)
 
 static void nau8825_xtalk_cancel(struct nau8825 *nau8825)
 {
-	/* If the xtalk_protect is true, that means the process is still
-	 * on going. The driver forces to cancel the cross talk task and
+	/* If the crosstalk is eanbled and the process is on going,
+	 * the driver forces to cancel the crosstalk task and
 	 * restores the configuration to original status.
 	 */
-	if (nau8825->xtalk_protect) {
+	if (nau8825->xtalk_enable && nau8825->xtalk_state !=
+		NAU8825_XTALK_DONE) {
 		cancel_work_sync(&nau8825->xtalk_work);
 		nau8825_xtalk_clean(nau8825);
 	}
@@ -905,6 +906,7 @@ static int nau8825_adc_event(struct snd_soc_dapm_widget *w,
 
 	switch (event) {
 	case SND_SOC_DAPM_POST_PMU:
+		msleep(125);
 		regmap_update_bits(nau8825->regmap, NAU8825_REG_ENA_CTRL,
 			NAU8825_ENABLE_ADC, NAU8825_ENABLE_ADC);
 		break;
@@ -1231,7 +1233,7 @@ static int nau8825_hw_params(struct snd_pcm_substream *substream,
 {
 	struct snd_soc_codec *codec = dai->codec;
 	struct nau8825 *nau8825 = snd_soc_codec_get_drvdata(codec);
-	unsigned int val_len = 0, osr;
+	unsigned int val_len = 0, osr, ctrl_val, bclk_fs, bclk_div;
 
 	nau8825_sema_acquire(nau8825, 3 * HZ);
 
@@ -1259,6 +1261,24 @@ static int nau8825_hw_params(struct snd_pcm_substream *substream,
 		regmap_update_bits(nau8825->regmap, NAU8825_REG_CLK_DIVIDER,
 			NAU8825_CLK_ADC_SRC_MASK,
 			osr_adc_sel[osr].clk_src << NAU8825_CLK_ADC_SRC_SFT);
+	}
+
+	/* make BCLK and LRC divde configuration if the codec as master. */
+	regmap_read(nau8825->regmap, NAU8825_REG_I2S_PCM_CTRL2, &ctrl_val);
+	if (ctrl_val & NAU8825_I2S_MS_MASTER) {
+		/* get the bclk and fs ratio */
+		bclk_fs = snd_soc_params_to_bclk(params) / params_rate(params);
+		if (bclk_fs <= 32)
+			bclk_div = 2;
+		else if (bclk_fs <= 64)
+			bclk_div = 1;
+		else if (bclk_fs <= 128)
+			bclk_div = 0;
+		else
+			return -EINVAL;
+		regmap_update_bits(nau8825->regmap, NAU8825_REG_I2S_PCM_CTRL2,
+			NAU8825_I2S_LRC_DIV_MASK | NAU8825_I2S_BLK_DIV_MASK,
+			((bclk_div + 1) << NAU8825_I2S_LRC_DIV_SFT) | bclk_div);
 	}
 
 	switch (params_width(params)) {
@@ -1668,7 +1688,7 @@ static irqreturn_t nau8825_interrupt(int irq, void *data)
 	} else if (active_irq & NAU8825_HEADSET_COMPLETION_IRQ) {
 		if (nau8825_is_jack_inserted(regmap)) {
 			event |= nau8825_jack_insert(nau8825);
-			if (!nau8825->xtalk_bypass && !nau8825->high_imped) {
+			if (nau8825->xtalk_enable && !nau8825->high_imped) {
 				/* Apply the cross talk suppression in the
 				 * headset without high impedance.
 				 */
@@ -1714,8 +1734,10 @@ static irqreturn_t nau8825_interrupt(int irq, void *data)
 			nau8825->xtalk_event_mask = event_mask;
 		}
 	} else if (active_irq & NAU8825_IMPEDANCE_MEAS_IRQ) {
-		schedule_work(&nau8825->xtalk_work);
-		clear_irq = NAU8825_IMPEDANCE_MEAS_IRQ;
+		if (nau8825->xtalk_enable) {
+			schedule_work(&nau8825->xtalk_work);
+			clear_irq = NAU8825_IMPEDANCE_MEAS_IRQ;
+		}
 	} else if ((active_irq & NAU8825_JACK_INSERTION_IRQ_MASK) ==
 		NAU8825_JACK_INSERTION_DETECTED) {
 		/* One more step to check GPIO status directly. Thus, the
@@ -1837,6 +1859,10 @@ static void nau8825_init_regs(struct nau8825 *nau8825)
 		NAU8825_JACK_EJECT_DEBOUNCE_MASK,
 		nau8825->jack_eject_debounce << NAU8825_JACK_EJECT_DEBOUNCE_SFT);
 
+	/* Pull up IRQ pin */
+	regmap_update_bits(regmap, NAU8825_REG_INTERRUPT_MASK,
+		NAU8825_IRQ_PIN_PULLUP | NAU8825_IRQ_PIN_PULL_EN,
+		NAU8825_IRQ_PIN_PULLUP | NAU8825_IRQ_PIN_PULL_EN);
 	/* Mask unneeded IRQs: 1 - disable, 0 - enable */
 	regmap_update_bits(regmap, NAU8825_REG_INTERRUPT_MASK, 0x7ff, 0x7ff);
 
@@ -2422,8 +2448,8 @@ static void nau8825_print_device_properties(struct nau8825 *nau8825)
 			nau8825->jack_insert_debounce);
 	dev_dbg(dev, "jack-eject-debounce:  %d\n",
 			nau8825->jack_eject_debounce);
-	dev_dbg(dev, "crosstalk-bypass:     %d\n",
-			nau8825->xtalk_bypass);
+	dev_dbg(dev, "crosstalk-enable:     %d\n",
+			nau8825->xtalk_enable);
 }
 
 static int nau8825_read_device_properties(struct device *dev,
@@ -2488,8 +2514,8 @@ static int nau8825_read_device_properties(struct device *dev,
 		&nau8825->jack_eject_debounce);
 	if (ret)
 		nau8825->jack_eject_debounce = 0;
-	nau8825->xtalk_bypass = device_property_read_bool(dev,
-		"nuvoton,crosstalk-bypass");
+	nau8825->xtalk_enable = device_property_read_bool(dev,
+		"nuvoton,crosstalk-enable");
 
 	nau8825->mclk = devm_clk_get(dev, "mclk");
 	if (PTR_ERR(nau8825->mclk) == -EPROBE_DEFER) {

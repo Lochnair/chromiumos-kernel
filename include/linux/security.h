@@ -3239,6 +3239,16 @@ int chromiumos_security_load_firmware(struct file *file, char *buf,
 void chromiumos_security_sb_free(struct super_block *sb);
 int chromiumos_security_inode_follow_link(struct dentry *dentry,
 					  struct nameidata *nd);
+int chromiumos_security_file_open(struct file *file, const struct cred *cred);
+int chromiumos_security_capable(const struct cred *cred,
+				struct user_namespace *ns,
+				int cap);
+int chromiumos_security_task_fix_setuid(struct cred *new,
+					const struct cred *old,
+					int flags);
+int chromiumos_sb_copy_data(char *orig, char *copy);
+int chromiumos_sb_kern_mount(struct super_block *sb, int flags, void *data);
+int chromiumos_security_sb_umount(struct vfsmount *mnt, int flags);
 #else
 static inline
 int chromiumos_security_sb_mount(const char *dev_name, struct path *path,
@@ -3265,6 +3275,40 @@ void chromiumos_security_sb_free(struct super_block *sb)
 static inline
 int chromiumos_security_inode_follow_link(struct dentry *dentry,
 					  struct nameidata *nd)
+{
+	return 0;
+}
+static inline
+int chromiumos_security_file_open(struct file *file, const struct cred *cred)
+{
+	return 0;
+}
+static inline
+int chromiumos_security_capable(const struct cred *cred,
+				struct user_namespace *ns,
+				int cap)
+{
+	return 0;
+}
+static inline
+int chromiumos_sb_copy_data(char *orig, char *copy)
+{
+	return 0;
+}
+static inline
+int chromiumos_security_task_fix_setuid(struct cred *new,
+					const struct cred *old,
+					int flags)
+{
+	return 0;
+}
+static inline
+int chromiumos_sb_kern_mount(struct super_block *sb, int flags, void *data)
+{
+	return 0;
+}
+static inline
+int chromiumos_security_sb_umount(struct vfsmount *mnt, int flags)
 {
 	return 0;
 }

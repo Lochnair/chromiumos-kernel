@@ -204,6 +204,9 @@ static int __netlink_deliver_tap_skb(struct sk_buff *skb,
 	struct sock *sk = skb->sk;
 	int ret = -ENOMEM;
 
+	if (!net_eq(dev_net(dev), sock_net(sk)))
+		return 0;
+
 	dev_hold(dev);
 	nskb = skb_clone(skb, GFP_ATOMIC);
 	if (nskb) {
@@ -1085,10 +1088,10 @@ static int netlink_insert(struct sock *sk, struct net *net, u32 portid)
 	struct netlink_table *table = &nl_table[sk->sk_protocol];
 	int err = -EADDRINUSE;
 
-	lock_sock(sk);
+	mutex_lock(&table->hash.mutex);
 
-	err = -EBUSY;
-	if (nlk_sk(sk)->portid)
+	err = nlk_sk(sk)->portid == portid ? 0 : -EBUSY;
+	if (nlk_sk(sk)->bound)
 		goto err;
 
 	err = -ENOMEM;
@@ -1104,10 +1107,15 @@ static int netlink_insert(struct sock *sk, struct net *net, u32 portid)
 		if (err == -EEXIST)
 			err = -EADDRINUSE;
 		sock_put(sk);
+		goto err;
 	}
 
+	/* We need to ensure that the socket is hashed and visible. */
+	smp_wmb();
+	nlk_sk(sk)->bound = portid;
+
 err:
-	release_sock(sk);
+	mutex_unlock(&table->hash.mutex);
 	return err;
 }
 
@@ -1116,11 +1124,13 @@ static void netlink_remove(struct sock *sk)
 	struct netlink_table *table;
 
 	table = &nl_table[sk->sk_protocol];
+	mutex_lock(&table->hash.mutex);
 	if (!rhashtable_remove_fast(&table->hash, &nlk_sk(sk)->node,
 				    netlink_rhashtable_params)) {
 		WARN_ON(atomic_read(&sk->sk_refcnt) == 1);
 		__sock_put(sk);
 	}
+	mutex_unlock(&table->hash.mutex);
 
 	netlink_table_grab();
 	if (nlk_sk(sk)->subscriptions) {
@@ -1481,6 +1491,7 @@ static int netlink_bind(struct socket *sock, struct sockaddr *addr,
 	struct sockaddr_nl *nladdr = (struct sockaddr_nl *)addr;
 	int err;
 	long unsigned int groups = nladdr->nl_groups;
+	bool bound;
 
 	if (addr_len < sizeof(struct sockaddr_nl))
 		return -EINVAL;
@@ -1497,9 +1508,14 @@ static int netlink_bind(struct socket *sock, struct sockaddr *addr,
 			return err;
 	}
 
-	if (nlk->portid)
+	bound = nlk->bound;
+	if (bound) {
+		/* Ensure nlk->portid is up-to-date. */
+		smp_rmb();
+
 		if (nladdr->nl_pid != nlk->portid)
 			return -EINVAL;
+	}
 
 	if (nlk->netlink_bind && groups) {
 		int group;
@@ -1515,7 +1531,10 @@ static int netlink_bind(struct socket *sock, struct sockaddr *addr,
 		}
 	}
 
-	if (!nlk->portid) {
+	/* No need for barriers here as we return to user-space without
+	 * using any of the bound attributes.
+	 */
+	if (!bound) {
 		err = nladdr->nl_pid ?
 			netlink_insert(sk, net, nladdr->nl_pid) :
 			netlink_autobind(sock);
@@ -1563,7 +1582,10 @@ static int netlink_connect(struct socket *sock, struct sockaddr *addr,
 	    !netlink_allowed(sock, NL_CFG_F_NONROOT_SEND))
 		return -EPERM;
 
-	if (!nlk->portid)
+	/* No need for barriers here as we return to user-space without
+	 * using any of the bound attributes.
+	 */
+	if (!nlk->bound)
 		err = netlink_autobind(sock);
 
 	if (err == 0) {
@@ -2327,10 +2349,13 @@ static int netlink_sendmsg(struct kiocb *kiocb, struct socket *sock,
 		dst_group = nlk->dst_group;
 	}
 
-	if (!nlk->portid) {
+	if (!nlk->bound) {
 		err = netlink_autobind(sock);
 		if (err)
 			goto out;
+	} else {
+		/* Ensure nlk is hashed and visible. */
+		smp_rmb();
 	}
 
 	if (netlink_tx_is_mmaped(sk) &&
@@ -2776,6 +2801,7 @@ int __netlink_dump_start(struct sock *ssk, struct sk_buff *skb,
 
 	cb = &nlk->cb;
 	memset(cb, 0, sizeof(*cb));
+	cb->start = control->start;
 	cb->dump = control->dump;
 	cb->done = control->done;
 	cb->nlh = nlh;
@@ -2787,6 +2813,9 @@ int __netlink_dump_start(struct sock *ssk, struct sk_buff *skb,
 	nlk->cb_running = true;
 
 	mutex_unlock(nlk->cb_mutex);
+
+	if (cb->start)
+		cb->start(cb);
 
 	ret = netlink_dump(sk);
 	sock_put(sk);
@@ -3163,13 +3192,12 @@ static inline u32 netlink_hash(const void *data, u32 len, u32 seed)
 	struct netlink_compare_arg arg;
 
 	netlink_compare_arg_init(&arg, sock_net(&nlk->sk), nlk->portid);
-	return jhash(&arg, netlink_compare_arg_len, seed);
+	return jhash2((u32 *)&arg, netlink_compare_arg_len / sizeof(u32), seed);
 }
 
 static const struct rhashtable_params netlink_rhashtable_params = {
 	.head_offset = offsetof(struct netlink_sock, node),
 	.key_len = netlink_compare_arg_len,
-	.hashfn = jhash,
 	.obj_hashfn = netlink_hash,
 	.obj_cmpfn = netlink_compare,
 	.max_size = 65536,

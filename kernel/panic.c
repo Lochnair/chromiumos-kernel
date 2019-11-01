@@ -430,7 +430,9 @@ static void warn_slowpath_common(const char *file, int line, void *caller,
 {
 	disable_trace_on_warning();
 
-	pr_warn("------------[ cut here ]------------\n");
+	if (args)
+		pr_warn(CUT_HERE);
+
 	pr_warn("WARNING: CPU: %d PID: %d at %s:%d %pS()\n",
 		raw_smp_processor_id(), current->pid, file, line, caller);
 
@@ -471,10 +473,23 @@ EXPORT_SYMBOL(warn_slowpath_fmt_taint);
 
 void warn_slowpath_null(const char *file, int line)
 {
+	pr_warn(CUT_HERE);
 	warn_slowpath_common(file, line, __builtin_return_address(0),
 			     TAINT_WARN, NULL);
 }
 EXPORT_SYMBOL(warn_slowpath_null);
+#else
+void __warn_printk(const char *fmt, ...)
+{
+	va_list args;
+
+	pr_warn(CUT_HERE);
+
+	va_start(args, fmt);
+	vprintk(fmt, args);
+	va_end(args);
+}
+EXPORT_SYMBOL(__warn_printk);
 #endif
 
 #ifdef CONFIG_CC_STACKPROTECTOR

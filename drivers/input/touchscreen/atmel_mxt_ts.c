@@ -3868,7 +3868,8 @@ static int mxt_probe(struct i2c_client *client,
 		return error;
 	}
 
-	data->reset_gpio = devm_gpiod_get(&client->dev, "atmel,reset");
+	data->reset_gpio = devm_gpiod_get(&client->dev, "atmel,reset",
+					  GPIOD_OUT_LOW);
 	if (IS_ERR(data->reset_gpio)) {
 		error = PTR_ERR(data->reset_gpio);
 
@@ -3892,15 +3893,6 @@ static int mxt_probe(struct i2c_client *client,
 		if (error != -ENOENT && error != -ENOSYS) {
 			dev_err(&client->dev,
 				"failed to get reset gpio: %d\n",
-				error);
-			return error;
-		}
-
-	} else {
-		error = gpiod_direction_output(data->reset_gpio, 0);
-		if (error) {
-			dev_err(&client->dev,
-				"failed to configure reset gpio as output: %d\n",
 				error);
 			return error;
 		}

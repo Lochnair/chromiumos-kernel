@@ -630,7 +630,7 @@ static long vhost_set_memory(struct vhost_dev *d, struct vhost_memory __user *m)
 	return 0;
 }
 
-long vhost_vring_ioctl(struct vhost_dev *d, int ioctl, void __user *argp)
+long vhost_vring_ioctl(struct vhost_dev *d, unsigned int ioctl, void __user *argp)
 {
 	struct file *eventfp, *filep = NULL;
 	bool pollstart = false, pollstop = false;
@@ -1036,7 +1036,7 @@ static int vhost_update_avail_event(struct vhost_virtqueue *vq, u16 avail_event)
 	return 0;
 }
 
-int vhost_init_used(struct vhost_virtqueue *vq)
+int vhost_vq_init_access(struct vhost_virtqueue *vq)
 {
 	int r;
 	if (!vq->private_data)
@@ -1048,7 +1048,7 @@ int vhost_init_used(struct vhost_virtqueue *vq)
 	vq->signalled_used_valid = false;
 	return get_user(vq->last_used_idx, &vq->used->idx);
 }
-EXPORT_SYMBOL_GPL(vhost_init_used);
+EXPORT_SYMBOL_GPL(vhost_vq_init_access);
 
 static int translate_desc(struct vhost_virtqueue *vq, u64 addr, u32 len,
 			  struct iovec iov[], int iov_size)

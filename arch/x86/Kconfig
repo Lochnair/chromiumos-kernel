@@ -43,8 +43,11 @@ config X86
 	select ARCH_DISCARD_MEMBLOCK
 	select ARCH_WANT_OPTIONAL_GPIOLIB
 	select ARCH_WANT_FRAME_POINTERS
+	select HAVE_ARCH_HARDENED_USERCOPY
+	select HAVE_ARCH_WITHIN_STACK_FRAMES
 	select HAVE_ARCH_MMAP_RND_BITS		if MMU
 	select HAVE_ARCH_MMAP_RND_COMPAT_BITS	if MMU && COMPAT
+	select GENERIC_CPU_VULNERABILITIES
 	select HAVE_DMA_ATTRS
 	select HAVE_DMA_CONTIGUOUS
 	select HAVE_KRETPROBES
@@ -194,7 +197,7 @@ config SBUS
 
 config NEED_DMA_MAP_STATE
 	def_bool y
-	depends on X86_64 || INTEL_IOMMU || DMA_API_DEBUG
+	depends on X86_64 || INTEL_IOMMU || DMA_API_DEBUG || SWIOTLB
 
 config NEED_SG_DMA_LENGTH
 	def_bool y
@@ -384,6 +387,19 @@ config X86_BIGSMP
 config GOLDFISH
        def_bool y
        depends on X86_GOLDFISH
+
+config RETPOLINE
+	bool "Avoid speculative indirect branches in kernel"
+	default y
+	---help---
+	  Compile kernel with the retpoline compiler options to guard against
+	  kernel-to-user data leaks by avoiding speculative indirect
+	  branches. Requires a compiler with -mindirect-branch=thunk-extern
+	  support for full protection. The kernel may run slower.
+
+	  Without compiler support, at least indirect branches in assembler
+	  code are eliminated. Since this includes the syscall entry path,
+	  it is not entirely pointless.
 
 if X86_32
 config X86_EXTENDED_PLATFORM
@@ -883,7 +899,7 @@ source "kernel/Kconfig.preempt"
 
 config X86_UP_APIC
 	bool "Local APIC support on uniprocessors"
-	depends on X86_32 && !SMP && !X86_32_NON_STANDARD && !PCI_MSI
+	depends on X86_32 && !SMP && !X86_32_NON_STANDARD
 	---help---
 	  A local APIC (Advanced Programmable Interrupt Controller) is an
 	  integrated interrupt controller in the CPU. If you have a single-CPU
@@ -893,6 +909,10 @@ config X86_UP_APIC
 	  all. The local APIC supports CPU-generated self-interrupts (timer,
 	  performance counters), and the NMI watchdog which detects hard
 	  lockups.
+
+config X86_UP_APIC_MSI
+	def_bool y
+	select X86_UP_APIC if X86_32 && !SMP && !X86_32_NON_STANDARD && PCI_MSI
 
 config X86_UP_IOAPIC
 	bool "IO-APIC support on uniprocessors"
@@ -1070,23 +1090,26 @@ config X86_REBOOTFIXUPS
 	  Say N otherwise.
 
 config MICROCODE
-	tristate "CPU microcode loading support"
+	bool "CPU microcode loading support"
+	default y
 	depends on CPU_SUP_AMD || CPU_SUP_INTEL
 	select FW_LOADER
 	---help---
-
 	  If you say Y here, you will be able to update the microcode on
-	  certain Intel and AMD processors. The Intel support is for the
-	  IA32 family, e.g. Pentium Pro, Pentium II, Pentium III, Pentium 4,
-	  Xeon etc. The AMD support is for families 0x10 and later. You will
-	  obviously need the actual microcode binary data itself which is not
-	  shipped with the Linux kernel.
+	  Intel and AMD processors. The Intel support is for the IA32 family,
+	  e.g. Pentium Pro, Pentium II, Pentium III, Pentium 4, Xeon etc. The
+	  AMD support is for families 0x10 and later. You will obviously need
+	  the actual microcode binary data itself which is not shipped with
+	  the Linux kernel.
 
-	  This option selects the general module only, you need to select
-	  at least one vendor specific module as well.
+	  The preferred method to load microcode from a detached initrd is described
+	  in Documentation/x86/early-microcode.txt. For that you need to enable
+	  CONFIG_BLK_DEV_INITRD in order for the loader to be able to scan the
+	  initrd for microcode blobs.
 
-	  To compile this driver as a module, choose M here: the module
-	  will be called microcode.
+	  In addition, you can build-in the microcode into the kernel. For that you
+	  need to enable FIRMWARE_IN_KERNEL and add the vendor-supplied microcode
+	  to the CONFIG_EXTRA_FIRMWARE config option.
 
 config MICROCODE_INTEL
 	bool "Intel microcode loading support"
@@ -1112,24 +1135,6 @@ config MICROCODE_AMD
 config MICROCODE_OLD_INTERFACE
 	def_bool y
 	depends on MICROCODE
-
-config MICROCODE_INTEL_EARLY
-	def_bool n
-
-config MICROCODE_AMD_EARLY
-	def_bool n
-
-config MICROCODE_EARLY
-	bool "Early load microcode"
-	depends on MICROCODE=y && BLK_DEV_INITRD
-	select MICROCODE_INTEL_EARLY if MICROCODE_INTEL
-	select MICROCODE_AMD_EARLY if MICROCODE_AMD
-	default y
-	help
-	  This option provides functionality to read additional microcode data
-	  at the beginning of initrd image. The data tells kernel to load
-	  microcode to CPU's as early as possible. No functional change if no
-	  microcode data is glued to the initrd, therefore it's safe to say Y.
 
 config X86_MSR
 	tristate "/dev/cpu/*/msr - Model-specific register support"
@@ -2494,10 +2499,6 @@ config COMPAT_FOR_U64_ALIGNMENT
 config SYSVIPC_COMPAT
 	def_bool y
 	depends on SYSVIPC
-
-config KEYS_COMPAT
-	def_bool y
-	depends on KEYS
 endif
 
 endmenu

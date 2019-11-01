@@ -14,8 +14,11 @@
 #include <linux/slab.h>
 #include <linux/sysctl.h>
 
+#include <asm/alternative.h>
+#include <asm/cpufeature.h>
 #include <asm/insn.h>
 #include <asm/opcodes.h>
+#include <asm/sysreg.h>
 #include <asm/system_misc.h>
 #include <asm/traps.h>
 #include <asm/uaccess.h>
@@ -59,7 +62,7 @@ struct insn_emulation {
 };
 
 static LIST_HEAD(insn_emulation);
-static int nr_insn_emulated;
+static int nr_insn_emulated __initdata;
 static DEFINE_RAW_SPINLOCK(insn_emulation_lock);
 
 static void register_emulation_hooks(struct insn_emulation_ops *ops)
@@ -170,7 +173,7 @@ static int update_insn_emulation_mode(struct insn_emulation *insn,
 	return ret;
 }
 
-static void register_insn_emulation(struct insn_emulation_ops *ops)
+static void __init register_insn_emulation(struct insn_emulation_ops *ops)
 {
 	unsigned long flags;
 	struct insn_emulation *insn;
@@ -234,7 +237,7 @@ static struct ctl_table ctl_abi[] = {
 	{ }
 };
 
-static void register_insn_emulation_sysctl(struct ctl_table *table)
+static void __init register_insn_emulation_sysctl(struct ctl_table *table)
 {
 	unsigned long flags;
 	int i = 0;
@@ -279,6 +282,8 @@ static void register_insn_emulation_sysctl(struct ctl_table *table)
  */
 #define __user_swpX_asm(data, addr, res, temp, B)		\
 	__asm__ __volatile__(					\
+	ALTERNATIVE("nop", SET_PSTATE_PAN(0), ARM64_HAS_PAN,	\
+		    CONFIG_ARM64_PAN)				\
 	"0:	ldxr"B"		%w2, [%3]\n"			\
 	"1:	stxr"B"		%w0, %w1, [%3]\n"		\
 	"	cbz		%w0, 2f\n"			\
@@ -296,9 +301,12 @@ static void register_insn_emulation_sysctl(struct ctl_table *table)
 	"	.align		3\n"				\
 	"	.quad		0b, 4b\n"			\
 	"	.quad		1b, 4b\n"			\
-	"	.popsection"					\
+	"	.popsection\n"					\
+	ALTERNATIVE("nop", SET_PSTATE_PAN(1), ARM64_HAS_PAN,	\
+		CONFIG_ARM64_PAN)				\
 	: "=&r" (res), "+r" (data), "=&r" (temp)		\
-	: "r" (addr), "i" (-EAGAIN), "i" (-EFAULT)		\
+	: "r" ((unsigned long)addr), "i" (-EAGAIN),		\
+	  "i" (-EFAULT)						\
 	: "memory")
 
 #define __user_swp_asm(data, addr, res, temp) \
@@ -504,16 +512,6 @@ ret:
 
 	regs->pc += 4;
 	return 0;
-}
-
-static inline void config_sctlr_el1(u32 clear, u32 set)
-{
-	u32 val;
-
-	asm volatile("mrs %0, sctlr_el1" : "=r" (val));
-	val &= ~clear;
-	val |= set;
-	asm volatile("msr sctlr_el1, %0" : : "r" (val));
 }
 
 static int cp15_barrier_set_hw_mode(bool enable)

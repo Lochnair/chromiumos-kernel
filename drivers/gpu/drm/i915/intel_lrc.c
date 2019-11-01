@@ -220,6 +220,11 @@ enum {
 #define GEN8_CTX_ID_SHIFT 32
 #define CTX_RCS_INDIRECT_CTX_OFFSET_DEFAULT  0x17
 
+#define   GUC_WOPCM_SIZE_VALUE  	  (0x80 << 12)	/* 512KB */
+
+/* GuC addresses below GUC_WOPCM_TOP don't map through the GTT */
+#define	GUC_WOPCM_TOP			(GUC_WOPCM_SIZE_VALUE)
+
 static int intel_lr_context_pin(struct drm_i915_gem_request *rq);
 
 /**
@@ -263,25 +268,35 @@ int intel_sanitize_enable_execlists(struct drm_device *dev, int enable_execlists
  */
 u32 intel_execlists_ctx_id(struct drm_i915_gem_object *ctx_obj)
 {
-	u32 lrca = i915_gem_obj_ggtt_offset(ctx_obj);
+	u32 lrca = i915_gem_obj_ggtt_offset(ctx_obj) +
+			LRC_PPHWSP_PN * PAGE_SIZE;
 
 	/* LRCA is required to be 4K aligned so the more significant 20 bits
 	 * are globally unique */
 	return lrca >> 12;
 }
 
+static bool disable_lite_restore_wa(struct intel_engine_cs *ring)
+{
+	struct drm_device *dev = ring->dev;
+
+	return ((IS_SKYLAKE(dev) && INTEL_REVID(dev) <= SKL_REVID_B0) ||
+		(IS_BROXTON(dev) && INTEL_REVID(dev) == BXT_REVID_A0)) &&
+	       (ring->id == VCS || ring->id == VCS2);
+}
+
 static uint64_t execlists_ctx_descriptor(struct drm_i915_gem_request *rq)
 {
 	struct intel_engine_cs *ring = rq->ring;
-	struct drm_device *dev = ring->dev;
 	struct drm_i915_gem_object *ctx_obj = rq->ctx->engine[ring->id].state;
 	uint64_t desc;
-	uint64_t lrca = i915_gem_obj_ggtt_offset(ctx_obj);
+	uint64_t lrca = i915_gem_obj_ggtt_offset(ctx_obj) +
+			LRC_PPHWSP_PN * PAGE_SIZE;
 
 	WARN_ON(lrca & 0xFFFFFFFF00000FFFULL);
 
 	desc = GEN8_CTX_VALID;
-	desc |= GEN8_CTX_ADDRESSING_MODE(dev) << GEN8_CTX_ADDRESSING_MODE_SHIFT;
+	desc |= GEN8_CTX_ADDRESSING_MODE(ring->dev) << GEN8_CTX_ADDRESSING_MODE_SHIFT;
 	if (IS_GEN8(ctx_obj->base.dev))
 		desc |= GEN8_CTX_L3LLC_COHERENT;
 	desc |= GEN8_CTX_PRIVILEGE;
@@ -293,10 +308,8 @@ static uint64_t execlists_ctx_descriptor(struct drm_i915_gem_request *rq)
 	/* desc |= GEN8_CTX_FORCE_RESTORE; */
 
 	/* WaEnableForceRestoreInCtxtDescForVCS:skl */
-	if (IS_GEN9(dev) &&
-	    INTEL_REVID(dev) <= SKL_REVID_B0 &&
-	    (ring->id == BCS || ring->id == VCS ||
-	    ring->id == VECS || ring->id == VCS2))
+	/* WaEnableForceRestoreInCtxtDescForVCS:bxt */
+	if (disable_lite_restore_wa(ring))
 		desc |= GEN8_CTX_FORCE_RESTORE;
 
 	return desc;
@@ -332,7 +345,7 @@ static void execlists_elsp_write(struct drm_i915_gem_request *rq0,
 	I915_WRITE_FW(RING_ELSP(ring), lower_32_bits(desc[0]));
 
 	/* ELSP is a wo register, use another nearby reg for posting */
-	POSTING_READ_FW(RING_EXECLIST_STATUS(ring));
+	POSTING_READ_FW(RING_EXECLIST_STATUS_LO(ring));
 	intel_uncore_forcewake_put__locked(dev_priv, FORCEWAKE_ALL);
 	spin_unlock(&dev_priv->uncore.lock);
 }
@@ -350,7 +363,7 @@ static int execlists_update_context(struct drm_i915_gem_request *rq)
 	WARN_ON(!i915_gem_obj_is_pinned(ctx_obj));
 	WARN_ON(!i915_gem_obj_is_pinned(rb_obj));
 
-	page = i915_gem_object_get_page(ctx_obj, 1);
+	page = i915_gem_object_get_dirty_page(ctx_obj, LRC_STATE_PN);
 	reg_state = kmap_atomic(page);
 
 	reg_state[CTX_RING_TAIL+1] = rq->tail;
@@ -487,7 +500,7 @@ void intel_lrc_irq_handler(struct intel_engine_cs *ring)
 	u32 status_pointer;
 	u8 read_pointer;
 	u8 write_pointer;
-	u32 status;
+	u32 status = 0;
 	u32 status_id;
 	u32 submit_contexts = 0;
 
@@ -502,10 +515,8 @@ void intel_lrc_irq_handler(struct intel_engine_cs *ring)
 
 	while (read_pointer < write_pointer) {
 		read_pointer++;
-		status = I915_READ(RING_CONTEXT_STATUS_BUF(ring) +
-				(read_pointer % GEN8_CSB_ENTRIES) * 8);
-		status_id = I915_READ(RING_CONTEXT_STATUS_BUF(ring) +
-				(read_pointer % GEN8_CSB_ENTRIES) * 8 + 4);
+		status = I915_READ(RING_CONTEXT_STATUS_BUF_LO(ring, read_pointer % 6));
+		status_id = I915_READ(RING_CONTEXT_STATUS_BUF_HI(ring, read_pointer % 6));
 
 		if (status & GEN8_CTX_STATUS_PREEMPTED) {
 			if (status & GEN8_CTX_STATUS_LITE_RESTORE) {
@@ -522,8 +533,14 @@ void intel_lrc_irq_handler(struct intel_engine_cs *ring)
 		}
 	}
 
-	if (submit_contexts != 0)
+	if (disable_lite_restore_wa(ring)) {
+		/* Prevent a ctx to preempt itself */
+		if ((status & GEN8_CTX_STATUS_ACTIVE_IDLE) &&
+		    (submit_contexts != 0))
+			execlists_context_unqueue(ring);
+	} else if (submit_contexts != 0) {
 		execlists_context_unqueue(ring);
+	}
 
 	spin_unlock(&ring->execlist_lock);
 
@@ -546,8 +563,6 @@ static int execlists_context_queue(struct drm_i915_gem_request *request)
 		intel_lr_context_pin(request);
 
 	i915_gem_request_reference(request);
-
-	request->tail = request->ringbuf->tail;
 
 	spin_lock_irq(&ring->execlist_lock);
 
@@ -697,17 +712,29 @@ static int logical_ring_wait_for_space(struct drm_i915_gem_request *req,
  * on a queue waiting for the ELSP to be ready to accept a new context submission. At that
  * point, the tail *inside* the context is updated and the ELSP written to.
  */
-static void
+static int
 intel_logical_ring_advance_and_submit(struct drm_i915_gem_request *request)
 {
-	struct intel_engine_cs *ring = request->ring;
+	struct intel_ringbuffer *ringbuf = request->ringbuf;
 
-	intel_logical_ring_advance(request->ringbuf);
+	intel_logical_ring_advance(ringbuf);
+	request->tail = ringbuf->tail;
 
-	if (intel_ring_stopped(ring))
-		return;
+	/*
+	 * Here we add two extra NOOPs as padding to avoid
+	 * lite restore of a context with HEAD==TAIL.
+	 *
+	 * Caller must reserve WA_TAIL_DWORDS for us!
+	 */
+	intel_logical_ring_emit(ringbuf, MI_NOOP);
+	intel_logical_ring_emit(ringbuf, MI_NOOP);
+	intel_logical_ring_advance(ringbuf);
+
+	if (intel_ring_stopped(request->ring))
+		return 0;
 
 	execlists_context_queue(request);
+	return 0;
 }
 
 static void __wrap_ring_buffer(struct intel_ringbuffer *ringbuf)
@@ -1004,14 +1031,16 @@ static int intel_lr_context_pin(struct drm_i915_gem_request *rq)
 
 	WARN_ON(!mutex_is_locked(&ring->dev->struct_mutex));
 	if (rq->ctx->engine[ring->id].pin_count++ == 0) {
-		ret = i915_gem_obj_ggtt_pin(ctx_obj,
-				GEN8_LR_CONTEXT_ALIGN, 0);
+		ret = i915_gem_obj_ggtt_pin(ctx_obj, GEN8_LR_CONTEXT_ALIGN,
+				PIN_OFFSET_BIAS | GUC_WOPCM_TOP);
 		if (ret)
 			goto reset_pin_count;
 
 		ret = intel_pin_and_map_ringbuffer_obj(ring->dev, ringbuf);
 		if (ret)
 			goto unpin_ctx_obj;
+
+		ctx_obj->dirty = true;
 	}
 
 	return ret;
@@ -1205,9 +1234,10 @@ static int gen8_init_indirectctx_bb(struct intel_engine_cs *ring,
 
 	/* WaFlushCoherentL3CacheLinesAtContextSwitch:bdw */
 	if (IS_BROADWELL(ring->dev)) {
-		index = gen8_emit_flush_coherentl3_wa(ring, batch, index);
-		if (index < 0)
-			return index;
+		int rc = gen8_emit_flush_coherentl3_wa(ring, batch, index);
+		if (rc < 0)
+			return rc;
+		index = rc;
 	}
 
 	/* WaClearSlmSpaceAtContextSwitch:bdw,chv */
@@ -1383,7 +1413,7 @@ static int intel_init_workaround_bb(struct intel_engine_cs *ring)
 		return ret;
 	}
 
-	page = i915_gem_object_get_page(wa_ctx->obj, 0);
+	page = i915_gem_object_get_dirty_page(wa_ctx->obj, 0);
 	batch = kmap_atomic(page);
 	offset = 0;
 
@@ -1551,7 +1581,8 @@ static int gen8_emit_bb_start(struct drm_i915_gem_request *req,
 	 * not needed in 48-bit.*/
 	if (req->ctx->ppgtt &&
 	    (intel_ring_flag(req->ring) & req->ctx->ppgtt->pd_dirty_rings)) {
-		if (!USES_FULL_48BIT_PPGTT(req->i915)) {
+		if (!USES_FULL_48BIT_PPGTT(req->i915) &&
+		    !intel_vgpu_active(req->i915->dev)) {
 			ret = intel_logical_ring_emit_pdps(req);
 			if (ret)
 				return ret;
@@ -1667,6 +1698,7 @@ static int gen8_emit_flush_render(struct drm_i915_gem_request *request,
 	if (flush_domains) {
 		flags |= PIPE_CONTROL_RENDER_TARGET_CACHE_FLUSH;
 		flags |= PIPE_CONTROL_DEPTH_CACHE_FLUSH;
+		flags |= PIPE_CONTROL_FLUSH_ENABLE;
 	}
 
 	if (invalidate_domains) {
@@ -1721,44 +1753,94 @@ static void gen8_set_seqno(struct intel_engine_cs *ring, u32 seqno)
 	intel_write_status_page(ring, I915_GEM_HWS_INDEX, seqno);
 }
 
+static u32 bxt_a_get_seqno(struct intel_engine_cs *ring, bool lazy_coherency)
+{
+
+	/*
+	 * On BXT A steppings there is a HW coherency issue whereby the
+	 * MI_STORE_DATA_IMM storing the completed request's seqno
+	 * occasionally doesn't invalidate the CPU cache. Work around this by
+	 * clflushing the corresponding cacheline whenever the caller wants
+	 * the coherency to be guaranteed. Note that this cacheline is known
+	 * to be clean at this point, since we only write it in
+	 * bxt_a_set_seqno(), where we also do a clflush after the write. So
+	 * this clflush in practice becomes an invalidate operation.
+	 */
+
+	if (!lazy_coherency)
+		intel_flush_status_page(ring, I915_GEM_HWS_INDEX);
+
+	return intel_read_status_page(ring, I915_GEM_HWS_INDEX);
+}
+
+static void bxt_a_set_seqno(struct intel_engine_cs *ring, u32 seqno)
+{
+	intel_write_status_page(ring, I915_GEM_HWS_INDEX, seqno);
+
+	/* See bxt_a_get_seqno() explaining the reason for the clflush. */
+	intel_flush_status_page(ring, I915_GEM_HWS_INDEX);
+}
+
+/*
+ * Reserve space for 2 NOOPs at the end of each request to be
+ * used as a workaround for not being allowed to do lite
+ * restore with HEAD==TAIL (WaIdleLiteRestore).
+ */
+#define WA_TAIL_DWORDS 2
+
 static int gen8_emit_request(struct drm_i915_gem_request *request)
 {
 	struct intel_ringbuffer *ringbuf = request->ringbuf;
-	struct intel_engine_cs *ring = ringbuf->ring;
-	u32 cmd;
 	int ret;
 
-	/*
-	 * Reserve space for 2 NOOPs at the end of each request to be
-	 * used as a workaround for not being allowed to do lite
-	 * restore with HEAD==TAIL (WaIdleLiteRestore).
-	 */
-	ret = intel_logical_ring_begin(request, 8);
+	ret = intel_logical_ring_begin(request, 6 + WA_TAIL_DWORDS);
 	if (ret)
 		return ret;
 
-	cmd = MI_STORE_DWORD_IMM_GEN4;
-	cmd |= MI_GLOBAL_GTT;
+	/* w/a: bit 5 needs to be zero for MI_FLUSH_DW address. */
+	BUILD_BUG_ON(I915_GEM_HWS_INDEX_ADDR & (1 << 5));
 
-	intel_logical_ring_emit(ringbuf, cmd);
 	intel_logical_ring_emit(ringbuf,
-				(ring->status_page.gfx_addr +
-				(I915_GEM_HWS_INDEX << MI_STORE_DWORD_INDEX_SHIFT)));
+				(MI_FLUSH_DW + 1) | MI_FLUSH_DW_OP_STOREDW);
+	intel_logical_ring_emit(ringbuf,
+				intel_hws_seqno_address(request->ring) |
+				MI_FLUSH_DW_USE_GTT);
 	intel_logical_ring_emit(ringbuf, 0);
 	intel_logical_ring_emit(ringbuf, i915_gem_request_get_seqno(request));
 	intel_logical_ring_emit(ringbuf, MI_USER_INTERRUPT);
 	intel_logical_ring_emit(ringbuf, MI_NOOP);
-	intel_logical_ring_advance_and_submit(request);
+	return intel_logical_ring_advance_and_submit(request);
+}
 
-	/*
-	 * Here we add two extra NOOPs as padding to avoid
-	 * lite restore of a context with HEAD==TAIL.
+static int gen8_emit_request_render(struct drm_i915_gem_request *request)
+{
+	struct intel_ringbuffer *ringbuf = request->ringbuf;
+	int ret;
+
+	ret = intel_logical_ring_begin(request, 8 + WA_TAIL_DWORDS);
+	if (ret)
+		return ret;
+
+	/* We're using qword write, seqno should be aligned to 8 bytes. */
+	BUILD_BUG_ON(I915_GEM_HWS_INDEX & 1);
+
+	/* w/a for post sync ops following a GPGPU operation we
+	 * need a prior CS_STALL, which is emitted by the flush
+	 * following the batch.
 	 */
+	intel_logical_ring_emit(ringbuf, GFX_OP_PIPE_CONTROL(6));
+	intel_logical_ring_emit(ringbuf,
+				(PIPE_CONTROL_GLOBAL_GTT_IVB |
+				 PIPE_CONTROL_CS_STALL |
+				 PIPE_CONTROL_QW_WRITE));
+	intel_logical_ring_emit(ringbuf, intel_hws_seqno_address(request->ring));
+	intel_logical_ring_emit(ringbuf, 0);
+	intel_logical_ring_emit(ringbuf, i915_gem_request_get_seqno(request));
+	/* We're thrashing one dword of HWS. */
+	intel_logical_ring_emit(ringbuf, 0);
+	intel_logical_ring_emit(ringbuf, MI_USER_INTERRUPT);
 	intel_logical_ring_emit(ringbuf, MI_NOOP);
-	intel_logical_ring_emit(ringbuf, MI_NOOP);
-	intel_logical_ring_advance(ringbuf);
-
-	return 0;
+	return intel_logical_ring_advance_and_submit(request);
 }
 
 static int intel_lr_context_render_state_init(struct drm_i915_gem_request *req)
@@ -1774,6 +1856,12 @@ static int intel_lr_context_render_state_init(struct drm_i915_gem_request *req)
 		return 0;
 
 	ret = req->ring->emit_bb_start(req, so.ggtt_offset,
+				       I915_DISPATCH_SECURE);
+	if (ret)
+		goto out;
+
+	ret = req->ring->emit_bb_start(req,
+				       (so.ggtt_offset + so.aux_batch_offset),
 				       I915_DISPATCH_SECURE);
 	if (ret)
 		goto out;
@@ -1836,6 +1924,26 @@ void intel_logical_ring_cleanup(struct intel_engine_cs *ring)
 	lrc_destroy_wa_ctx_obj(ring);
 }
 
+static void
+logical_ring_default_vfuncs(struct drm_device *dev,
+			    struct intel_engine_cs *ring)
+{
+	/* Default vfuncs which can be overriden by each engine. */
+	ring->init_hw = gen8_init_common_ring;
+	ring->emit_request = gen8_emit_request;
+	ring->emit_flush = gen8_emit_flush;
+	ring->irq_get = gen8_logical_ring_get_irq;
+	ring->irq_put = gen8_logical_ring_put_irq;
+	ring->emit_bb_start = gen8_emit_bb_start;
+	if (IS_BXT_REVID(dev, 0, BXT_REVID_A1)) {
+		ring->get_seqno = bxt_a_get_seqno;
+		ring->set_seqno = bxt_a_set_seqno;
+	} else {
+		ring->get_seqno = gen8_get_seqno;
+		ring->set_seqno = gen8_set_seqno;
+	}
+}
+
 static int logical_ring_init(struct drm_device *dev, struct intel_engine_cs *ring)
 {
 	int ret;
@@ -1878,19 +1986,18 @@ static int logical_render_ring_init(struct drm_device *dev)
 	if (HAS_L3_DPF(dev))
 		ring->irq_keep_mask |= GT_RENDER_L3_PARITY_ERROR_INTERRUPT;
 
+	logical_ring_default_vfuncs(dev, ring);
+
+	/* Override some for render ring. */
+
 	if (INTEL_INFO(dev)->gen >= 9)
 		ring->init_hw = gen9_init_render_ring;
 	else
 		ring->init_hw = gen8_init_render_ring;
 	ring->init_context = gen8_init_rcs_context;
 	ring->cleanup = intel_fini_pipe_control;
-	ring->get_seqno = gen8_get_seqno;
-	ring->set_seqno = gen8_set_seqno;
-	ring->emit_request = gen8_emit_request;
 	ring->emit_flush = gen8_emit_flush_render;
-	ring->irq_get = gen8_logical_ring_get_irq;
-	ring->irq_put = gen8_logical_ring_put_irq;
-	ring->emit_bb_start = gen8_emit_bb_start;
+	ring->emit_request = gen8_emit_request_render;
 
 	ring->dev = dev;
 
@@ -1930,14 +2037,7 @@ static int logical_bsd_ring_init(struct drm_device *dev)
 	ring->irq_keep_mask =
 		GT_CONTEXT_SWITCH_INTERRUPT << GEN8_VCS1_IRQ_SHIFT;
 
-	ring->init_hw = gen8_init_common_ring;
-	ring->get_seqno = gen8_get_seqno;
-	ring->set_seqno = gen8_set_seqno;
-	ring->emit_request = gen8_emit_request;
-	ring->emit_flush = gen8_emit_flush;
-	ring->irq_get = gen8_logical_ring_get_irq;
-	ring->irq_put = gen8_logical_ring_put_irq;
-	ring->emit_bb_start = gen8_emit_bb_start;
+	logical_ring_default_vfuncs(dev, ring);
 
 	return logical_ring_init(dev, ring);
 }
@@ -1955,14 +2055,7 @@ static int logical_bsd2_ring_init(struct drm_device *dev)
 	ring->irq_keep_mask =
 		GT_CONTEXT_SWITCH_INTERRUPT << GEN8_VCS2_IRQ_SHIFT;
 
-	ring->init_hw = gen8_init_common_ring;
-	ring->get_seqno = gen8_get_seqno;
-	ring->set_seqno = gen8_set_seqno;
-	ring->emit_request = gen8_emit_request;
-	ring->emit_flush = gen8_emit_flush;
-	ring->irq_get = gen8_logical_ring_get_irq;
-	ring->irq_put = gen8_logical_ring_put_irq;
-	ring->emit_bb_start = gen8_emit_bb_start;
+	logical_ring_default_vfuncs(dev, ring);
 
 	return logical_ring_init(dev, ring);
 }
@@ -1980,14 +2073,7 @@ static int logical_blt_ring_init(struct drm_device *dev)
 	ring->irq_keep_mask =
 		GT_CONTEXT_SWITCH_INTERRUPT << GEN8_BCS_IRQ_SHIFT;
 
-	ring->init_hw = gen8_init_common_ring;
-	ring->get_seqno = gen8_get_seqno;
-	ring->set_seqno = gen8_set_seqno;
-	ring->emit_request = gen8_emit_request;
-	ring->emit_flush = gen8_emit_flush;
-	ring->irq_get = gen8_logical_ring_get_irq;
-	ring->irq_put = gen8_logical_ring_put_irq;
-	ring->emit_bb_start = gen8_emit_bb_start;
+	logical_ring_default_vfuncs(dev, ring);
 
 	return logical_ring_init(dev, ring);
 }
@@ -2005,14 +2091,7 @@ static int logical_vebox_ring_init(struct drm_device *dev)
 	ring->irq_keep_mask =
 		GT_CONTEXT_SWITCH_INTERRUPT << GEN8_VECS_IRQ_SHIFT;
 
-	ring->init_hw = gen8_init_common_ring;
-	ring->get_seqno = gen8_get_seqno;
-	ring->set_seqno = gen8_set_seqno;
-	ring->emit_request = gen8_emit_request;
-	ring->emit_flush = gen8_emit_flush;
-	ring->irq_get = gen8_logical_ring_get_irq;
-	ring->irq_put = gen8_logical_ring_put_irq;
-	ring->emit_bb_start = gen8_emit_bb_start;
+	logical_ring_default_vfuncs(dev, ring);
 
 	return logical_ring_init(dev, ring);
 }
@@ -2153,7 +2232,7 @@ populate_lr_context(struct intel_context *ctx, struct drm_i915_gem_object *ctx_o
 
 	/* The second page of the context object contains some fields which must
 	 * be set up prior to the first execution. */
-	page = i915_gem_object_get_page(ctx_obj, 1);
+	page = i915_gem_object_get_dirty_page(ctx_obj, LRC_STATE_PN);
 	reg_state = kmap_atomic(page);
 
 	/* A context is actually a big batch buffer with several MI_LOAD_REGISTER_IMM
@@ -2256,8 +2335,6 @@ populate_lr_context(struct intel_context *ctx, struct drm_i915_gem_object *ctx_o
 
 	kunmap_atomic(reg_state);
 
-	ctx_obj->dirty = 1;
-	set_page_dirty(page);
 	i915_gem_object_unpin_pages(ctx_obj);
 
 	return 0;
@@ -2288,8 +2365,7 @@ void intel_lr_context_free(struct intel_context *ctx)
 				i915_gem_object_ggtt_unpin(ctx_obj);
 			}
 			WARN_ON(ctx->engine[ring->id].pin_count);
-			intel_destroy_ringbuffer_obj(ringbuf);
-			kfree(ringbuf);
+			intel_ringbuffer_free(ringbuf);
 			drm_gem_object_unreference(&ctx_obj->base);
 		}
 	}
@@ -2323,12 +2399,13 @@ static void lrc_setup_hardware_status_page(struct intel_engine_cs *ring,
 		struct drm_i915_gem_object *default_ctx_obj)
 {
 	struct drm_i915_private *dev_priv = ring->dev->dev_private;
+	struct page *page;
 
-	/* The status page is offset 0 from the default context object
-	 * in LRC mode. */
-	ring->status_page.gfx_addr = i915_gem_obj_ggtt_offset(default_ctx_obj);
-	ring->status_page.page_addr =
-			kmap(sg_page(default_ctx_obj->pages->sgl));
+	/* The HWSP is part of the default context object in LRC mode. */
+	ring->status_page.gfx_addr = i915_gem_obj_ggtt_offset(default_ctx_obj)
+			+ LRC_PPHWSP_PN * PAGE_SIZE;
+	page = i915_gem_object_get_dirty_page(default_ctx_obj, LRC_PPHWSP_PN);
+	ring->status_page.page_addr = kmap(page);
 	ring->status_page.obj = default_ctx_obj;
 
 	I915_WRITE(RING_HWS_PGA(ring->mmio_base),
@@ -2349,6 +2426,7 @@ static void lrc_setup_hardware_status_page(struct intel_engine_cs *ring,
  *
  * Return: non-zero on error.
  */
+
 int intel_lr_context_deferred_create(struct intel_context *ctx,
 				     struct intel_engine_cs *ring)
 {
@@ -2364,6 +2442,9 @@ int intel_lr_context_deferred_create(struct intel_context *ctx,
 
 	context_size = round_up(get_lr_context_size(ring), 4096);
 
+	/* One extra page as the sharing data between driver and GuC */
+	context_size += PAGE_SIZE * LRC_PPHWSP_PN;
+
 	ctx_obj = i915_gem_alloc_object(dev, context_size);
 	if (!ctx_obj) {
 		DRM_DEBUG_DRIVER("Alloc LRC backing obj failed.\n");
@@ -2371,7 +2452,8 @@ int intel_lr_context_deferred_create(struct intel_context *ctx,
 	}
 
 	if (is_global_default_ctx) {
-		ret = i915_gem_obj_ggtt_pin(ctx_obj, GEN8_LR_CONTEXT_ALIGN, 0);
+		ret = i915_gem_obj_ggtt_pin(ctx_obj, GEN8_LR_CONTEXT_ALIGN,
+				PIN_OFFSET_BIAS | GUC_WOPCM_TOP);
 		if (ret) {
 			DRM_DEBUG_DRIVER("Pin LRC backing obj failed: %d\n",
 					ret);
@@ -2380,42 +2462,20 @@ int intel_lr_context_deferred_create(struct intel_context *ctx,
 		}
 	}
 
-	ringbuf = kzalloc(sizeof(*ringbuf), GFP_KERNEL);
-	if (!ringbuf) {
-		DRM_DEBUG_DRIVER("Failed to allocate ringbuffer %s\n",
-				ring->name);
-		ret = -ENOMEM;
+	ringbuf = intel_engine_create_ringbuffer(ring, 4 * PAGE_SIZE);
+	if (IS_ERR(ringbuf)) {
+		ret = PTR_ERR(ringbuf);
 		goto error_unpin_ctx;
 	}
 
-	ringbuf->ring = ring;
-
-	ringbuf->size = 32 * PAGE_SIZE;
-	ringbuf->effective_size = ringbuf->size;
-	ringbuf->head = 0;
-	ringbuf->tail = 0;
-	ringbuf->last_retired_head = -1;
-	intel_ring_update_space(ringbuf);
-
-	if (ringbuf->obj == NULL) {
-		ret = intel_alloc_ringbuffer_obj(dev, ringbuf);
+	if (is_global_default_ctx) {
+		ret = intel_pin_and_map_ringbuffer_obj(dev, ringbuf);
 		if (ret) {
-			DRM_DEBUG_DRIVER(
-				"Failed to allocate ringbuffer obj %s: %d\n",
-				ring->name, ret);
-			goto error_free_rbuf;
+			DRM_ERROR(
+				  "Failed to pin and map ringbuffer %s: %d\n",
+				  ring->name, ret);
+			goto error_ringbuf;
 		}
-
-		if (is_global_default_ctx) {
-			ret = intel_pin_and_map_ringbuffer_obj(dev, ringbuf);
-			if (ret) {
-				DRM_ERROR(
-					"Failed to pin and map ringbuffer %s: %d\n",
-					ring->name, ret);
-				goto error_destroy_rbuf;
-			}
-		}
-
 	}
 
 	ret = populate_lr_context(ctx, ctx_obj, ring, ringbuf);
@@ -2457,10 +2517,8 @@ int intel_lr_context_deferred_create(struct intel_context *ctx,
 error:
 	if (is_global_default_ctx)
 		intel_unpin_ringbuffer_obj(ringbuf);
-error_destroy_rbuf:
-	intel_destroy_ringbuffer_obj(ringbuf);
-error_free_rbuf:
-	kfree(ringbuf);
+error_ringbuf:
+	intel_ringbuffer_free(ringbuf);
 error_unpin_ctx:
 	if (is_global_default_ctx)
 		i915_gem_object_ggtt_unpin(ctx_obj);
@@ -2490,7 +2548,7 @@ void intel_lr_context_reset(struct drm_device *dev,
 			WARN(1, "Failed get_pages for context obj\n");
 			continue;
 		}
-		page = i915_gem_object_get_page(ctx_obj, 1);
+		page = i915_gem_object_get_dirty_page(ctx_obj, LRC_STATE_PN);
 		reg_state = kmap_atomic(page);
 
 		reg_state[CTX_RING_HEAD+1] = 0;

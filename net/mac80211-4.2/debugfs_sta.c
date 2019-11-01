@@ -118,6 +118,55 @@ static ssize_t sta_last_seq_ctrl_read(struct file *file, char __user *userbuf,
 }
 STA_OPS(last_seq_ctrl);
 
+#define AQM_TXQ_ENTRY_LEN 130
+
+static ssize_t sta_aqm_read(struct file *file, char __user *userbuf,
+			    size_t count, loff_t *ppos)
+{
+	struct sta_info *sta = file->private_data;
+	struct ieee80211_local *local = sta->local;
+	size_t bufsz = AQM_TXQ_ENTRY_LEN*(IEEE80211_NUM_TIDS+1);
+	char *buf = kzalloc(bufsz, GFP_KERNEL), *p = buf;
+	struct txq_info *txqi;
+	ssize_t rv;
+	int i;
+
+	if (!buf)
+		return -ENOMEM;
+
+	spin_lock_bh(&local->fq.lock);
+	rcu_read_lock();
+
+	p += scnprintf(p,
+		       bufsz+buf-p,
+		       "tid ac backlog-bytes backlog-packets new-flows drops marks overlimit collisions tx-bytes tx-packets\n");
+
+	for (i = 0; i < IEEE80211_NUM_TIDS; i++) {
+		txqi = to_txq_info(sta->sta.txq[i]);
+		p += scnprintf(p, bufsz+buf-p,
+			       "%d %d %u %u %u %u %u %u %u %u %u\n",
+			       txqi->txq.tid,
+			       txqi->txq.ac,
+			       txqi->tin.backlog_bytes,
+			       txqi->tin.backlog_packets,
+			       txqi->tin.flows,
+			       txqi->cstats.drop_count,
+			       txqi->cstats.ecn_mark,
+			       txqi->tin.overlimit,
+			       txqi->tin.collisions,
+			       txqi->tin.tx_bytes,
+			       txqi->tin.tx_packets);
+	}
+
+	rcu_read_unlock();
+	spin_unlock_bh(&local->fq.lock);
+
+	rv = simple_read_from_buffer(userbuf, count, ppos, buf, p - buf);
+	kfree(buf);
+	return rv;
+}
+STA_OPS(aqm);
+
 static ssize_t sta_agg_status_read(struct file *file, char __user *userbuf,
 					size_t count, loff_t *ppos)
 {
@@ -424,6 +473,135 @@ static ssize_t sta_rx_stats_read(struct file *file, char __user *userbuf,
 	return retval;
 }
 STA_OPS(rx_stats);
+
+static ssize_t sta_mc_bc_stats_read(struct file *file, char __user *userbuf,
+				 size_t count, loff_t *ppos)
+{
+	char buf[100], *p = buf;
+	struct sta_info *sta = file->private_data;
+
+	rcu_read_lock();
+	p += scnprintf(p, sizeof(buf) + buf - p, "mc_pkts: %llu\nmc_bytes: %llu\n",
+		sta->mc_bc_stat.mc_pkts, sta->mc_bc_stat.mc_bytes);
+	p += scnprintf(p, sizeof(buf) + buf - p, "bc_pkts: %llu\nbc_bytes: %llu\n",
+		sta->mc_bc_stat.bc_pkts, sta->mc_bc_stat.bc_bytes);
+
+	rcu_read_unlock();
+
+	return simple_read_from_buffer(userbuf, count, ppos, buf, p - buf);
+}
+static ssize_t sta_mc_bc_stats_write(struct file *file, const char __user *userbuf,
+				 size_t count, loff_t *ppos)
+{
+	char buf[8] = {}, *pbuf = buf;
+	struct sta_info *sta = file->private_data;
+
+	if (!sta) {
+		return -ENOENT;
+	}
+
+	if (count > sizeof(buf))
+		return -EINVAL;
+
+	if (copy_from_user(pbuf, userbuf, count))
+		return -EFAULT;
+
+	pbuf[sizeof(buf) - 1] = '\0';
+
+	if (strncmp(pbuf, "reset", 5) == 0) {
+		rcu_read_lock();
+		spin_lock_bh(&sta->lock);
+		sta->mc_bc_stat.mc_pkts = sta->mc_bc_stat.mc_bytes = 0;
+		sta->mc_bc_stat.bc_pkts = sta->mc_bc_stat.bc_bytes = 0;
+		spin_unlock_bh(&sta->lock);
+		rcu_read_unlock();
+	} else
+		return -EINVAL;
+
+	return count;
+}
+
+STA_OPS_RW(mc_bc_stats);
+
+static ssize_t sta_mc_bc_rx_limit_read(struct file *file, char __user *userbuf,
+				       size_t count, loff_t *ppos)
+{
+	char buf[100], *p = buf;
+	struct sta_info *sta = file->private_data;
+
+	rcu_read_lock();
+	p += scnprintf(p, sizeof(buf) + buf - p, "mc: %u\nbc: %u\n",
+		       sta->mc_rx_limit.rate, sta->bc_rx_limit.rate);
+
+	rcu_read_unlock();
+
+	return simple_read_from_buffer(userbuf, count, ppos, buf, p - buf);
+}
+
+static ssize_t sta_mc_bc_rx_limit_write(struct file *file,
+					const char __user *userbuf,
+					size_t count, loff_t *ppos)
+{
+	char buf[32] = {}, *pbuf = buf;
+	struct sta_info *sta = file->private_data;
+	int ret = 0;
+	bool mc = false, bc = false;
+	u32 rate = 0;
+
+	if (!sta)
+		return -ENOENT;
+
+	if (count > sizeof(buf))
+		return -EINVAL;
+
+	if (copy_from_user(pbuf, userbuf, count))
+		return -EFAULT;
+
+	pbuf[sizeof(buf) - 1] = '\0';
+
+	if (strncmp(pbuf, "mc:", 3) == 0) {
+		pbuf += 3;
+		mc = true;
+	} else if (strncmp(pbuf, "bc:", 3) == 0) {
+		pbuf += 3;
+		bc = true;
+	} else if (strncmp(pbuf, "reset", 5) == 0) {
+		rcu_read_lock();
+		spin_lock_bh(&sta->lock);
+		/* reset both multicast and broadcast to
+		 * interface default rate
+		 */
+		sta->mc_rx_limit.rate = sta->sdata->mc_rx_limit_rate;
+		sta->bc_rx_limit.rate = sta->sdata->bc_rx_limit_rate;
+		/* Calculate the bc/mc receive frame burst size */
+		mc_bc_burst_size(sta);
+		spin_unlock_bh(&sta->lock);
+		rcu_read_unlock();
+	} else {
+		return -EINVAL;
+	}
+
+	if (mc || bc) {
+		ret = kstrtouint(pbuf, 0, &rate);
+		/* Allow the rates less than 100000Kbps(100Mbps) */
+		if (rate <= 100000) {
+			rcu_read_lock();
+			spin_lock_bh(&sta->lock);
+			mc > bc ? (sta->mc_rx_limit.rate = rate) :
+				  (sta->bc_rx_limit.rate = rate);
+			/* Calculate the bc/mc receive frame burst size */
+			mc_bc_burst_size(sta);
+			spin_unlock_bh(&sta->lock);
+			rcu_read_unlock();
+		} else {
+			return -EINVAL;
+		}
+	}
+
+	return ret ?: count;
+}
+
+STA_OPS_RW(mc_bc_rx_limit);
 
 static ssize_t sta_vht_capa_read(struct file *file, char __user *userbuf,
 				 size_t count, loff_t *ppos)
@@ -746,6 +924,8 @@ void ieee80211_sta_debugfs_add(struct sta_info *sta)
 	DEBUGFS_ADD(vht_capa);
 	DEBUGFS_ADD(rx_stats);
 	DEBUGFS_ADD(last_ack_signal);
+	DEBUGFS_ADD(mc_bc_stats);
+	DEBUGFS_ADD(mc_bc_rx_limit);
 
 	DEBUGFS_ADD_COUNTER(rx_duplicates, num_duplicates);
 	DEBUGFS_ADD_COUNTER(rx_fragments, rx_fragments);
@@ -759,6 +939,9 @@ void ieee80211_sta_debugfs_add(struct sta_info *sta)
 #ifdef CONFIG_MAC80211_DEBUGFS
 	DEBUGFS_ADD(link_degrade_db);
 #endif
+
+	if (local->ops->wake_tx_queue)
+		DEBUGFS_ADD(aqm);
 
 	if (sizeof(sta->driver_buffered_tids) == sizeof(u32))
 		debugfs_create_x32("driver_buffered_tids", 0400,

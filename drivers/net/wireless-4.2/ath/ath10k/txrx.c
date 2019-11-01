@@ -49,15 +49,37 @@ out:
 	spin_unlock_bh(&ar->data_lock);
 }
 
-static inline u32 txdelay_time_to_10ms(u32 val)
+static inline u32 txdelay_time_to_ms(u32 val)
 {
 	u64 valns = ((u64)val << IEEE80211_TX_DELAY_SHIFT);
 
-	do_div(valns, NSEC_PER_MSEC * 10);
+	do_div(valns, NSEC_PER_MSEC);
 	return (u32)valns;
 }
 
-void ath10k_update_latency_stats(struct ath10k *ar, struct sk_buff *msdu, u8 ac)
+/* Returns transmit delay histogram stats bin to credit based on latency. */
+static inline int txdelay_ms_to_bin(u32 latency)
+{
+	int top_bit_set;
+	int bin_offset;
+
+	/* The exponential (power-of-two) bucket range is determined by the high
+	 * order bit set.  The first two 1ms bin (i.e. [0, 1) and [1, 2)) are
+	 * returned directly.  All other bins are subdivided in half by
+	 * calculating bin_offset based on the bit immediately to the right of
+	 * the high order bit set.
+	 */
+	top_bit_set = fls(latency);
+	if (top_bit_set < 2)
+		return top_bit_set;
+	if (top_bit_set > ATH10K_TX_DELAY_STATS_MAX_BIN)
+		return ATH10K_TX_DELAY_STATS_MAX_BIN;
+	bin_offset = (latency & (1 << (top_bit_set - 2))) ? 1 : 0;
+	return (top_bit_set - 1) * 2 + bin_offset;
+}
+
+void ath10k_update_latency_stats(struct ath10k *ar, struct sk_buff *msdu,
+				 u8 tid)
 {
 	u32	enqueue_time, now, bin;
 	struct ieee80211_tx_info *info;
@@ -69,11 +91,8 @@ void ath10k_update_latency_stats(struct ath10k *ar, struct sk_buff *msdu, u8 ac)
 	if (enqueue_time == 0)
 		return;
 
-	bin = txdelay_time_to_10ms(now - enqueue_time);
-	if (bin > ATH10K_DELAY_STATS_MAX_BIN)
-		bin = ATH10K_DELAY_STATS_MAX_BIN;
-
-	ar->debug.tx_delay_stats[ac]->counts[bin]++;
+	bin = txdelay_ms_to_bin(txdelay_time_to_ms(now - enqueue_time));
+	ar->debug.tx_delay_stats[tid]->counts[bin]++;
 }
 
 /* Update airtime upon tx completion. It is called while holding txq_lock */
@@ -152,7 +171,7 @@ int ath10k_txrx_tx_unref(struct ath10k_htt *htt,
 
 	info = IEEE80211_SKB_CB(msdu);
 	if (txq)
-		ath10k_update_latency_stats(htt->ar, msdu, txq->ac);
+		ath10k_update_latency_stats(htt->ar, msdu, txq->tid);
 	memset(&info->status, 0, sizeof(info->status));
 	info->status.rates[0].idx = -1;
 	trace_ath10k_txrx_tx_unref(ar, tx_done->msdu_id);

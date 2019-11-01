@@ -609,11 +609,14 @@ Type: vm ioctl
 Parameters: none
 Returns: 0 on success, -1 on error
 
-Creates an interrupt controller model in the kernel.  On x86, creates a virtual
-ioapic, a virtual PIC (two PICs, nested), and sets up future vcpus to have a
-local APIC.  IRQ routing for GSIs 0-15 is set to both PIC and IOAPIC; GSI 16-23
-only go to the IOAPIC.  On ia64, a IOSAPIC is created. On ARM/arm64, a GIC is
-created. On s390, a dummy irq routing table is created.
+Creates an interrupt controller model in the kernel.
+On x86, creates a virtual ioapic, a virtual PIC (two PICs, nested), and sets up
+future vcpus to have a local APIC.  IRQ routing for GSIs 0-15 is set to both
+PIC and IOAPIC; GSI 16-23 only go to the IOAPIC.
+On ARM/arm64, a GICv2 is created. Any other GIC versions require the usage of
+KVM_CREATE_DEVICE, which also supports creating a GICv2.  Using
+KVM_CREATE_DEVICE is preferred over KVM_CREATE_IRQCHIP for GICv2.
+On s390, a dummy irq routing table is created.
 
 Note that on s390 the KVM_CAP_S390_IRQCHIP vm capability needs to be enabled
 before KVM_CREATE_IRQCHIP can be used.
@@ -991,7 +994,7 @@ for vm-wide capabilities.
 4.38 KVM_GET_MP_STATE
 
 Capability: KVM_CAP_MP_STATE
-Architectures: x86, ia64, s390
+Architectures: x86, s390, arm, arm64
 Type: vcpu ioctl
 Parameters: struct kvm_mp_state (out)
 Returns: 0 on success; -1 on error
@@ -1014,8 +1017,8 @@ Possible values are:
  - KVM_MP_STATE_HALTED:          the vcpu has executed a HLT instruction and
                                  is waiting for an interrupt [x86, ia64]
  - KVM_MP_STATE_SIPI_RECEIVED:   the vcpu has just received a SIPI (vector
-                                 accessible via KVM_GET_VCPU_EVENTS) [x86, ia64]
- - KVM_MP_STATE_STOPPED:         the vcpu is stopped [s390]
+                                 accessible via KVM_GET_VCPU_EVENTS) [x86]
+ - KVM_MP_STATE_STOPPED:         the vcpu is stopped [s390,arm/arm64]
  - KVM_MP_STATE_CHECK_STOP:      the vcpu is in a special error state [s390]
  - KVM_MP_STATE_OPERATING:       the vcpu is operating (running or halted)
                                  [s390]
@@ -1026,6 +1029,10 @@ On x86 and ia64, this ioctl is only useful after KVM_CREATE_IRQCHIP. Without an
 in-kernel irqchip, the multiprocessing state must be maintained by userspace on
 these architectures.
 
+For arm/arm64:
+
+The only states that are valid are KVM_MP_STATE_STOPPED and
+KVM_MP_STATE_RUNNABLE which reflect if the vcpu is paused or not.
 
 4.39 KVM_SET_MP_STATE
 
@@ -1042,6 +1049,10 @@ On x86 and ia64, this ioctl is only useful after KVM_CREATE_IRQCHIP. Without an
 in-kernel irqchip, the multiprocessing state must be maintained by userspace on
 these architectures.
 
+For arm/arm64:
+
+The only states that are valid are KVM_MP_STATE_STOPPED and
+KVM_MP_STATE_RUNNABLE which reflect if the vcpu should be paused or not.
 
 4.40 KVM_SET_IDENTITY_MAP_ADDR
 
@@ -2206,7 +2217,7 @@ into the hash PTE second double word).
 4.75 KVM_IRQFD
 
 Capability: KVM_CAP_IRQFD
-Architectures: x86 s390
+Architectures: x86 s390 arm arm64
 Type: vm ioctl
 Parameters: struct kvm_irqfd (in)
 Returns: 0 on success, -1 on error
@@ -2231,6 +2242,10 @@ the interrupt if the device making use of it still requires service.
 Note that closing the resamplefd is not sufficient to disable the
 irqfd.  The KVM_IRQFD_FLAG_RESAMPLE is only necessary on assignment
 and need not be specified with KVM_IRQFD_FLAG_DEASSIGN.
+
+On ARM/ARM64, the gsi field in the kvm_irqfd struct specifies the Shared
+Peripheral Interrupt (SPI) index, such that the GIC interrupt ID is
+given by gsi + 32.
 
 4.76 KVM_PPC_ALLOCATE_HTAB
 
@@ -2453,9 +2468,15 @@ return ENOEXEC for that vcpu.
 Note that because some registers reflect machine topology, all vcpus
 should be created before this ioctl is invoked.
 
+Userspace can call this function multiple times for a given vcpu, including
+after the vcpu has been run. This will reset the vcpu to its initial
+state. All calls to this function after the initial call must use the same
+target and same set of feature flags, otherwise EINVAL will be returned.
+
 Possible features:
 	- KVM_ARM_VCPU_POWER_OFF: Starts the CPU in a power-off state.
-	  Depends on KVM_CAP_ARM_PSCI.
+	  Depends on KVM_CAP_ARM_PSCI.  If not set, the CPU will be powered on
+	  and execute guest code when KVM_RUN is called.
 	- KVM_ARM_VCPU_EL1_32BIT: Starts the CPU in a 32bit mode.
 	  Depends on KVM_CAP_ARM_EL1_32BIT (arm64 only).
 	- KVM_ARM_VCPU_PSCI_0_2: Emulate PSCI v0.2 for the CPU.
@@ -2570,7 +2591,7 @@ handled.
 4.87 KVM_SET_GUEST_DEBUG
 
 Capability: KVM_CAP_SET_GUEST_DEBUG
-Architectures: x86, s390, ppc
+Architectures: x86, s390, ppc, arm64
 Type: vcpu ioctl
 Parameters: struct kvm_guest_debug (in)
 Returns: 0 on success; -1 on error
@@ -2592,8 +2613,8 @@ when running. Common control bits are:
 The top 16 bits of the control field are architecture specific control
 flags which can include the following:
 
-  - KVM_GUESTDBG_USE_SW_BP:     using software breakpoints [x86]
-  - KVM_GUESTDBG_USE_HW_BP:     using hardware breakpoints [x86, s390]
+  - KVM_GUESTDBG_USE_SW_BP:     using software breakpoints [x86, arm64]
+  - KVM_GUESTDBG_USE_HW_BP:     using hardware breakpoints [x86, s390, arm64]
   - KVM_GUESTDBG_INJECT_DB:     inject DB type exception [x86]
   - KVM_GUESTDBG_INJECT_BP:     inject BP type exception [x86]
   - KVM_GUESTDBG_EXIT_PENDING:  trigger an immediate guest exit [s390]
@@ -2607,6 +2628,11 @@ updated to the correct (supplied) values.
 
 The second part of the structure is architecture specific and
 typically contains a set of debug registers.
+
+For arm64 the number of debug registers is implementation defined and
+can be determined by querying the KVM_CAP_GUEST_DEBUG_HW_BPS and
+KVM_CAP_GUEST_DEBUG_HW_WPS capabilities which return a positive number
+indicating the number of supported registers.
 
 When debug events exit the main run loop with the reason
 KVM_EXIT_DEBUG with the kvm_debug_exit_arch part of the kvm_run
@@ -2774,11 +2800,13 @@ data_offset describes where the data is located (KVM_EXIT_IO_OUT) or
 where kvm expects application code to place the data for the next
 KVM_RUN invocation (KVM_EXIT_IO_IN).  Data format is a packed array.
 
+		/* KVM_EXIT_DEBUG */
 		struct {
 			struct kvm_debug_exit_arch arch;
 		} debug;
 
-Unused.
+If the exit_reason is KVM_EXIT_DEBUG, then a vcpu is processing a debug event
+for which architecture specific information is returned.
 
 		/* KVM_EXIT_MMIO */
 		struct {
@@ -2950,6 +2978,15 @@ or some special instruction). In case of ARM/ARM64, this is triggered using
 HVC instruction based PSCI call from the vcpu. The 'type' field describes
 the system-level event type. The 'flags' field describes architecture
 specific flags for the system-level event.
+
+Valid values for 'type' are:
+  KVM_SYSTEM_EVENT_SHUTDOWN -- the guest has requested a shutdown of the
+   VM. Userspace is not obliged to honour this, and if it does honour
+   this does not need to destroy the VM synchronously (ie it may call
+   KVM_RUN again before shutdown finally occurs).
+  KVM_SYSTEM_EVENT_RESET -- the guest has requested a reset of the VM.
+   As with SHUTDOWN, userspace can choose to ignore the request, or
+   to schedule the reset to occur in the future and may call KVM_RUN again.
 
 		/* Fix the size of the union. */
 		char padding[256];

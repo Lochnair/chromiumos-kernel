@@ -13,20 +13,45 @@
 #include <asm/types.h>
 
 /*
+ * TOP_OF_KERNEL_STACK_PADDING is a number of unused bytes that we
+ * reserve at the top of the kernel stack.  We do it because of a nasty
+ * 32-bit corner case.  On x86_32, the hardware stack frame is
+ * variable-length.  Except for vm86 mode, struct pt_regs assumes a
+ * maximum-length frame.  If we enter from CPL 0, the top 8 bytes of
+ * pt_regs don't actually exist.  Ordinarily this doesn't matter, but it
+ * does in at least one case:
+ *
+ * If we take an NMI early enough in SYSENTER, then we can end up with
+ * pt_regs that extends above sp0.  On the way out, in the espfix code,
+ * we can read the saved SS value, but that value will be above sp0.
+ * Without this offset, that can result in a page fault.  (We are
+ * careful that, in this case, the value we read doesn't matter.)
+ *
+ * In vm86 mode, the hardware frame is much longer still, but we neither
+ * access the extra members from NMI context, nor do we write such a
+ * frame at sp0 at all.
+ *
+ * x86_64 has a fixed-length stack frame.
+ */
+#ifdef CONFIG_X86_32
+# define TOP_OF_KERNEL_STACK_PADDING 8
+#else
+# define TOP_OF_KERNEL_STACK_PADDING 0
+#endif
+
+/*
  * low level task data that entry.S needs immediate access to
  * - this struct should fit entirely inside of one cache line
  * - this struct shares the supervisor stack pages
  */
 #ifndef __ASSEMBLY__
 struct task_struct;
-struct exec_domain;
 typedef asmlinkage void (*ti_sys_call_ptr_t)(void);  /* from asm/syscall.h */
 #include <asm/processor.h>
 #include <linux/atomic.h>
 
 struct thread_info {
 	struct task_struct	*task;		/* main task structure */
-	struct exec_domain	*exec_domain;	/* execution domain */
 	__u32			flags;		/* low level flags */
 	__u32			status;		/* thread synchronous flags */
 	__u32			cpu;		/* current CPU */
@@ -72,7 +97,6 @@ extern const ti_sys_call_ptr_t ia32_sys_call_table[];
 #define INIT_THREAD_INFO(tsk)			\
 {						\
 	.task		= &tsk,			\
-	.exec_domain	= &default_exec_domain,	\
 	.flags		= 0,			\
 	.cpu		= 0,			\
 	.saved_preempt_count = INIT_PREEMPT_COUNT,	\
@@ -201,6 +225,50 @@ static inline struct thread_info *current_thread_info(void)
 	ti = (void *)(this_cpu_read_stable(kernel_stack) +
 		      KERNEL_STACK_OFFSET - THREAD_SIZE);
 	return ti;
+}
+
+/*
+ * Walks up the stack frames to make sure that the specified object is
+ * entirely contained by a single stack frame.
+ *
+ * Returns:
+ *		 1 if within a frame
+ *		-1 if placed across a frame boundary (or outside stack)
+ *		 0 unable to determine (no frame pointers, etc)
+ */
+static inline int arch_within_stack_frames(const void * const stack,
+					   const void * const stackend,
+					   const void *obj, unsigned long len)
+{
+#if defined(CONFIG_FRAME_POINTER)
+	const void *frame = NULL;
+	const void *oldframe;
+
+	oldframe = __builtin_frame_address(1);
+	if (oldframe)
+		frame = __builtin_frame_address(2);
+	/*
+	 * low ----------------------------------------------> high
+	 * [saved bp][saved ip][args][local vars][saved bp][saved ip]
+	 *                     ^----------------^
+	 *               allow copies only within here
+	 */
+	while (stack <= frame && frame < stackend) {
+		/*
+		 * If obj + len extends past the last frame, this
+		 * check won't pass and the next frame will be 0,
+		 * causing us to bail out and correctly report
+		 * the copy as invalid.
+		 */
+		if (obj + len <= frame)
+			return obj >= oldframe + 2 * sizeof(void *) ? 1 : -1;
+		oldframe = frame;
+		frame = *(const void * const *)frame;
+	}
+	return -1;
+#else
+	return 0;
+#endif
 }
 
 #else /* !__ASSEMBLY__ */

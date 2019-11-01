@@ -87,7 +87,7 @@ static inline int is_x32_frame(void)
 
 static __always_inline __pure bool use_eager_fpu(void)
 {
-	return static_cpu_has_safe(X86_FEATURE_EAGER_FPU);
+	return true;
 }
 
 static __always_inline __pure bool use_xsaveopt(void)
@@ -368,7 +368,7 @@ static inline void drop_fpu(struct task_struct *tsk)
 	preempt_disable();
 	tsk->thread.fpu_counter = 0;
 	__drop_fpu(tsk);
-	clear_used_math();
+	clear_stopped_child_used_math(tsk);
 	preempt_enable();
 }
 

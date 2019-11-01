@@ -167,6 +167,7 @@ struct ieee80211_tx_queue_params {
 	u16 cw_min;
 	u16 cw_max;
 	u8 aifs;
+	u8 noack;
 	bool acm;
 	bool uapsd;
 };

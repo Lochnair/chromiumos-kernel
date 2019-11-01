@@ -271,12 +271,29 @@ static void pgd_prepopulate_pmd(struct mm_struct *mm, pgd_t *pgd, pmd_t *pmds[])
 	}
 }
 
+/*
+ * Instead of one pgd, Kaiser acquires two pgds.  Being order-1, it is
+ * both 8k in size and 8k-aligned.  That lets us just flip bit 12
+ * in a pointer to swap between the two 4k halves.
+ */
+#define PGD_ALLOCATION_ORDER	kaiser_enabled
+
+static inline pgd_t *_pgd_alloc(void)
+{
+	return (pgd_t *)__get_free_pages(PGALLOC_GFP, PGD_ALLOCATION_ORDER);
+}
+
+static inline void _pgd_free(pgd_t *pgd)
+{
+	free_pages((unsigned long)pgd, PGD_ALLOCATION_ORDER);
+}
+
 pgd_t *pgd_alloc(struct mm_struct *mm)
 {
 	pgd_t *pgd;
 	pmd_t *pmds[PREALLOCATED_PMDS];
 
-	pgd = (pgd_t *)__get_free_page(PGALLOC_GFP);
+	pgd = _pgd_alloc();
 
 	if (pgd == NULL)
 		goto out;
@@ -306,7 +323,7 @@ pgd_t *pgd_alloc(struct mm_struct *mm)
 out_free_pmds:
 	free_pmds(pmds);
 out_free_pgd:
-	free_page((unsigned long)pgd);
+	_pgd_free(pgd);
 out:
 	return NULL;
 }
@@ -316,7 +333,7 @@ void pgd_free(struct mm_struct *mm, pgd_t *pgd)
 	pgd_mop_up_pmds(mm, pgd);
 	pgd_dtor(pgd);
 	paravirt_pgd_free(mm, pgd);
-	free_page((unsigned long)pgd);
+	_pgd_free(pgd);
 }
 
 /*

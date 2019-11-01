@@ -42,21 +42,36 @@
  * for is a boon.
  */
 
-int i915_gem_stolen_insert_node(struct drm_i915_private *dev_priv,
-				struct drm_mm_node *node, u64 size,
-				unsigned alignment)
+int i915_gem_stolen_insert_node_in_range(struct drm_i915_private *dev_priv,
+					 struct drm_mm_node *node, u64 size,
+					 unsigned alignment, u64 start, u64 end)
 {
 	int ret;
 
 	if (!drm_mm_initialized(&dev_priv->mm.stolen))
 		return -ENODEV;
 
+	/* See the comment at the drm_mm_init() call for more about this check.
+	 * WaSkipStolenMemoryFirstPage:bdw,chv (incomplete) */
+	if (INTEL_INFO(dev_priv)->gen == 8 && start < 4096)
+		start = 4096;
+
 	mutex_lock(&dev_priv->mm.stolen_lock);
-	ret = drm_mm_insert_node(&dev_priv->mm.stolen, node, size, alignment,
-				 DRM_MM_SEARCH_DEFAULT);
+	ret = drm_mm_insert_node_in_range(&dev_priv->mm.stolen, node, size,
+					  alignment, start, end,
+					  DRM_MM_SEARCH_DEFAULT);
 	mutex_unlock(&dev_priv->mm.stolen_lock);
 
 	return ret;
+}
+
+int i915_gem_stolen_insert_node(struct drm_i915_private *dev_priv,
+				struct drm_mm_node *node, u64 size,
+				unsigned alignment)
+{
+	return i915_gem_stolen_insert_node_in_range(dev_priv, node, size,
+					alignment, 0,
+					dev_priv->gtt.stolen_usable_size);
 }
 
 void i915_gem_stolen_remove_node(struct drm_i915_private *dev_priv,
@@ -353,9 +368,21 @@ int i915_gem_init_stolen(struct drm_device *dev)
 		      dev_priv->gtt.stolen_size >> 10,
 		      (dev_priv->gtt.stolen_size - reserved_total) >> 10);
 
-	/* Basic memrange allocator for stolen space */
-	drm_mm_init(&dev_priv->mm.stolen, 0, dev_priv->gtt.stolen_size -
-		    reserved_total);
+	dev_priv->gtt.stolen_usable_size = dev_priv->gtt.stolen_size -
+					   reserved_total;
+
+	/*
+	 * Basic memrange allocator for stolen space.
+	 *
+	 * TODO: Notice that some platforms require us to not use the first page
+	 * of the stolen memory but their BIOSes may still put the framebuffer
+	 * on the first page. So we don't reserve this page for now because of
+	 * that. Our current solution is to just prevent new nodes from being
+	 * inserted on the first page - see the check we have at
+	 * i915_gem_stolen_insert_node_in_range(). We may want to fix the fbcon
+	 * problem later.
+	 */
+	drm_mm_init(&dev_priv->mm.stolen, 0, dev_priv->gtt.stolen_usable_size);
 
 	return 0;
 }
@@ -563,6 +590,7 @@ i915_gem_object_create_stolen_for_preallocated(struct drm_device *dev,
 		}
 
 		vma->bound |= GLOBAL_BIND;
+		__i915_vma_set_map_and_fenceable(vma);
 		list_add_tail(&vma->mm_list, &ggtt->inactive_list);
 	}
 

@@ -705,6 +705,72 @@ static const struct file_operations fops_tx_success_bytes = {
 	.llseek = default_llseek,
 };
 
+static ssize_t ath10k_dbg_sta_read_ampdu_subframe_count(struct file *file,
+							char __user *user_buf,
+							size_t count,
+							loff_t *ppos)
+{
+	struct ieee80211_sta *sta = file->private_data;
+	struct ath10k_sta *arsta = (struct ath10k_sta *)sta->drv_priv;
+	struct ath10k *ar = arsta->arvif->ar;
+	char buf[32];
+	int len = 0;
+
+	mutex_lock(&ar->conf_mutex);
+	len = scnprintf(buf, sizeof(buf) - len,
+			"ampdu_subframe_count: %d\n",
+			arsta->ampdu_subframe_count);
+	mutex_unlock(&ar->conf_mutex);
+	return simple_read_from_buffer(user_buf, count, ppos, buf, len);
+}
+
+static ssize_t ath10k_dbg_sta_write_ampdu_subframe_count(struct file *file,
+							 const char __user *user_buf,
+							 size_t count,
+							 loff_t *ppos)
+{
+	struct ieee80211_sta *sta = file->private_data;
+	struct ath10k_sta *arsta = (struct ath10k_sta *)sta->drv_priv;
+	struct ath10k *ar = arsta->arvif->ar;
+	u8 ampdu_subframe_count;
+	int ret;
+
+	if (kstrtou8_from_user(user_buf, count, 0, &ampdu_subframe_count))
+		return -EINVAL;
+
+	if (ampdu_subframe_count > ATH10K_AMPDU_SUBFRAME_COUNT_MAX ||
+	    ampdu_subframe_count < ATH10K_AMPDU_SUBFRAME_COUNT_MIN)
+		return -EINVAL;
+
+	mutex_lock(&ar->conf_mutex);
+	if (ar->state != ATH10K_STATE_ON) {
+		ret = -EBUSY;
+		goto out;
+	}
+
+	ret = ath10k_wmi_peer_set_param(ar, arsta->arvif->vdev_id, sta->addr,
+					WMI_PEER_AMPDU, ampdu_subframe_count);
+	if (ret) {
+		ath10k_warn(ar, "failed to set ampdu subframe count for station"
+			    " ret: %d\n", ret);
+		goto out;
+	}
+
+	ret = count;
+	arsta->ampdu_subframe_count = ampdu_subframe_count;
+out:
+	mutex_unlock(&ar->conf_mutex);
+	return ret;
+}
+
+static const struct file_operations fops_set_ampdu_subframe_count = {
+	.read = ath10k_dbg_sta_read_ampdu_subframe_count,
+	.write = ath10k_dbg_sta_write_ampdu_subframe_count,
+	.open = simple_open,
+	.owner = THIS_MODULE,
+	.llseek = default_llseek,
+};
+
 static ssize_t ath10k_dbg_sta_read_tpc(struct file *file,
 				       char __user *user_buf,
 				       size_t count, loff_t *ppos)
@@ -762,6 +828,135 @@ out:
 static const struct file_operations fops_set_tpc = {
 	.read = ath10k_dbg_sta_read_tpc,
 	.write = ath10k_dbg_sta_write_tpc,
+	.open = simple_open,
+	.owner = THIS_MODULE,
+	.llseek = default_llseek,
+};
+
+static ssize_t ath10k_dbg_sta_write_cfr_capture(struct file *file,
+						const char __user *user_buf,
+						size_t count, loff_t *ppos)
+{
+	struct ieee80211_sta *sta = file->private_data;
+	struct ath10k_sta *arsta = (struct ath10k_sta *)sta->drv_priv;
+	struct ath10k *ar = arsta->arvif->ar;
+	struct wmi_peer_cfr_capture_conf_arg arg;
+	u32 per_peer_cfr_status = 0, per_peer_cfr_bw  = 0;
+	u32 per_peer_cfr_method = 0, per_peer_cfr_period = 0;
+	int ret;
+	char buf[64] = {0};
+
+	simple_write_to_buffer(buf, sizeof(buf) - 1, ppos, user_buf, count);
+
+	mutex_lock(&ar->conf_mutex);
+
+	if (ar->state != ATH10K_STATE_ON) {
+		ret = -ENETDOWN;
+		goto out;
+	}
+
+	ret = sscanf(buf, "%u %u %u %u", &per_peer_cfr_status, &per_peer_cfr_bw,
+		     &per_peer_cfr_period, &per_peer_cfr_method);
+
+	if (ret < 1) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	if (per_peer_cfr_status && ret != 4) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	if (per_peer_cfr_status == arsta->cfr_capture.cfr_enable &&
+	    (per_peer_cfr_period &&
+	    per_peer_cfr_period == arsta->cfr_capture.cfr_period) &&
+	    per_peer_cfr_bw == arsta->cfr_capture.cfr_bandwidth &&
+	    per_peer_cfr_method == arsta->cfr_capture.cfr_method) {
+		ret = count;
+		goto out;
+	}
+
+	if (per_peer_cfr_status > WMI_PEER_CFR_CAPTURE_ENABLE ||
+	    per_peer_cfr_status < WMI_PEER_CFR_CAPTURE_DISABLE ||
+	    per_peer_cfr_bw >= WMI_PEER_CFR_CAPTURE_BW_MAX  ||
+	    per_peer_cfr_bw < WMI_PEER_CFR_CAPTURE_BW_20MHZ ||
+	    per_peer_cfr_method < WMI_PEER_CFR_CAPTURE_METHOD_NULL_FRAME ||
+	    per_peer_cfr_method >= WMI_PEER_CFR_CAPTURE_METHOD_MAX ||
+	    per_peer_cfr_period < WMI_PEER_CFR_PERIODICITY_MIN ||
+	    per_peer_cfr_period > WMI_PEER_CFR_PERIODICITY_MAX) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	/*TODO: Need rework when base time is configurable*/
+	if (per_peer_cfr_period % 10) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	/*TODO:Need correction for 80+80 MHz*/
+	if (per_peer_cfr_bw > sta->bandwidth) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	if (!per_peer_cfr_status) {
+		per_peer_cfr_bw = arsta->cfr_capture.cfr_bandwidth;
+		per_peer_cfr_period = arsta->cfr_capture.cfr_period;
+		per_peer_cfr_method = arsta->cfr_capture.cfr_method;
+	}
+
+	arg.request = per_peer_cfr_status;
+	arg.periodicity = per_peer_cfr_period;
+	arg.bandwidth = per_peer_cfr_bw;
+	arg.capture_method = per_peer_cfr_method;
+
+	ret = ath10k_wmi_peer_set_cfr_capture_conf(ar, arsta->arvif->vdev_id,
+						   sta->addr, &arg);
+	if (ret) {
+		ath10k_warn(ar, "failed to send cfr capture info: vdev_id %u peer %pM\n",
+			    arsta->arvif->vdev_id, sta->addr);
+		goto out;
+	}
+
+	ret = count;
+
+	arsta->cfr_capture.cfr_enable = per_peer_cfr_status;
+	arsta->cfr_capture.cfr_period = per_peer_cfr_period;
+	arsta->cfr_capture.cfr_bandwidth = per_peer_cfr_bw;
+	arsta->cfr_capture.cfr_method = per_peer_cfr_method;
+out:
+	mutex_unlock(&ar->conf_mutex);
+	return ret;
+}
+
+static ssize_t ath10k_dbg_sta_read_cfr_capture(struct file *file,
+					       char __user *user_buf,
+					       size_t count, loff_t *ppos)
+{
+	struct ieee80211_sta *sta = file->private_data;
+	struct ath10k_sta *arsta = (struct ath10k_sta *)sta->drv_priv;
+	struct ath10k *ar = arsta->arvif->ar;
+	char buf[512];
+	int len = 0;
+
+	mutex_lock(&ar->conf_mutex);
+	len = scnprintf(buf, sizeof(buf) - len, "cfr_status: %s\n"
+			"cfr_bandwidth: %dMHz\ncfr_period: %d ms\ncfr_method: %d\n",
+			(arsta->cfr_capture.cfr_enable) ? "enabled" :
+			"disabled", (arsta->cfr_capture.cfr_bandwidth == 0) ?
+			20 : (arsta->cfr_capture.cfr_bandwidth == 1) ?
+			40 : 80, arsta->cfr_capture.cfr_period,
+			arsta->cfr_capture.cfr_method);
+	mutex_unlock(&ar->conf_mutex);
+
+	return simple_read_from_buffer(user_buf, count, ppos, buf, len);
+}
+
+static const struct file_operations fops_cfr_capture = {
+	.read = ath10k_dbg_sta_read_cfr_capture,
+	.write = ath10k_dbg_sta_write_cfr_capture,
 	.open = simple_open,
 	.owner = THIS_MODULE,
 	.llseek = default_llseek,
@@ -835,9 +1030,72 @@ static const struct file_operations fops_peer_ps_state = {
 	.llseek = default_llseek,
 };
 
+static ssize_t ath10k_dbg_sta_read_pspoll_sta_ko_enable(struct file *file,
+							char __user *user_buf,
+							size_t count, loff_t *ppos)
+{
+	struct ieee80211_sta *sta = file->private_data;
+	struct ath10k_sta *arsta = (struct ath10k_sta *)sta->drv_priv;
+	struct ath10k *ar = arsta->arvif->ar;
+	char buf[50];
+	int len = 0;
+
+	mutex_lock(&ar->conf_mutex);
+	len = scnprintf(buf, sizeof(buf) - len, "pspoll_sta_ko_enable: %d\n",
+			arsta->pspoll_sta_ko_enable);
+	mutex_unlock(&ar->conf_mutex);
+
+	return simple_read_from_buffer(user_buf, count, ppos, buf, len);
+}
+
+static ssize_t ath10k_dbg_sta_write_pspoll_sta_ko_enable(struct file *file,
+							 const char __user *user_buf,
+							 size_t count, loff_t *ppos)
+{
+	struct ieee80211_sta *sta = file->private_data;
+	struct ath10k_sta *arsta = (struct ath10k_sta *)sta->drv_priv;
+	struct ath10k *ar = arsta->arvif->ar;
+	u8 pspoll_sta_ko_enable;
+	int ret;
+
+	if (kstrtou8_from_user(user_buf, count, 0, &pspoll_sta_ko_enable))
+		return -EINVAL;
+
+	mutex_lock(&ar->conf_mutex);
+	if (ar->state != ATH10K_STATE_ON) {
+		ret = -EBUSY;
+		goto out;
+	}
+
+	ret = ath10k_wmi_peer_set_param(ar, arsta->arvif->vdev_id, sta->addr,
+					WMI_PEER_PS_POLL_KICKOUT,
+					pspoll_sta_ko_enable);
+	if (ret) {
+		ath10k_warn(ar, "failed to toggle pspoll sta kickout logic for"
+			    " station ret: %d\n", ret);
+		goto out;
+	}
+
+	ret = count;
+	arsta->pspoll_sta_ko_enable = pspoll_sta_ko_enable;
+out:
+	mutex_unlock(&ar->conf_mutex);
+	return ret;
+}
+
+static const struct file_operations fops_set_pspoll_sta_ko_enable = {
+	.read = ath10k_dbg_sta_read_pspoll_sta_ko_enable,
+	.write = ath10k_dbg_sta_write_pspoll_sta_ko_enable,
+	.open = simple_open,
+	.owner = THIS_MODULE,
+	.llseek = default_llseek,
+};
+
 void ath10k_sta_add_debugfs(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 			    struct ieee80211_sta *sta, struct dentry *dir)
 {
+	struct ath10k *ar = hw->priv;
+
 	debugfs_create_file("aggr_mode", S_IRUGO | S_IWUSR, dir, sta,
 			    &fops_aggr_mode);
 	debugfs_create_file("addba", S_IWUSR, dir, sta, &fops_addba);
@@ -847,9 +1105,18 @@ void ath10k_sta_add_debugfs(struct ieee80211_hw *hw, struct ieee80211_vif *vif,
 			    &fops_rx_duration);
 	debugfs_create_file("tpc", S_IRUGO | S_IWUSR, dir, sta,
 			    &fops_set_tpc);
+	debugfs_create_file("ampdu_subframe_count", S_IRUGO | S_IWUSR, dir, sta,
+			    &fops_set_ampdu_subframe_count);
 	debugfs_create_file("peer_tid_log", S_IRUSR, dir, sta, &fops_peer_tid_log);
 	debugfs_create_file("tx_success_bytes", S_IRUGO, dir, sta,
 			    &fops_tx_success_bytes);
 	debugfs_create_file("peer_ps_state", S_IRUSR, dir, sta,
 			    &fops_peer_ps_state);
+	debugfs_create_file("tx_stats", 0444, dir, sta,
+			    &fops_tx_stats);
+	if (test_bit(WMI_SERVICE_CFR_CAPTURE_SUPPORT, ar->wmi.svc_map))
+		debugfs_create_file("cfr_capture", 0644 , dir,
+				    sta, &fops_cfr_capture);
+	debugfs_create_file("pspoll_sta_ko_enable", S_IRUGO | S_IWUSR, dir, sta,
+			    &fops_set_pspoll_sta_ko_enable);
 }

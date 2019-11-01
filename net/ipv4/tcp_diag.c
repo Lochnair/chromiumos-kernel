@@ -21,13 +21,14 @@
 static void tcp_diag_get_info(struct sock *sk, struct inet_diag_msg *r,
 			      void *_info)
 {
-	const struct tcp_sock *tp = tcp_sk(sk);
 	struct tcp_info *info = _info;
 
 	if (sk->sk_state == TCP_LISTEN) {
 		r->idiag_rqueue = sk->sk_ack_backlog;
 		r->idiag_wqueue = sk->sk_max_ack_backlog;
-	} else {
+	} else if (sk->sk_type == SOCK_STREAM) {
+		const struct tcp_sock *tp = tcp_sk(sk);
+
 		r->idiag_rqueue = max_t(int, tp->rcv_nxt - tp->copied_seq, 0);
 		r->idiag_wqueue = tp->write_seq - tp->snd_una;
 	}
@@ -49,7 +50,7 @@ static int tcp_diag_dump_one(struct sk_buff *in_skb, const struct nlmsghdr *nlh,
 
 #ifdef CONFIG_INET_DIAG_DESTROY
 static int tcp_diag_destroy(struct sk_buff *in_skb,
-			    struct inet_diag_req_v2 *req)
+			    const struct inet_diag_req_v2 *req)
 {
 	struct net *net = sock_net(in_skb->sk);
 	struct sock *sk = inet_diag_find_one_icsk(net, &tcp_hashinfo, req);
@@ -69,6 +70,7 @@ static const struct inet_diag_handler tcp_diag_handler = {
 #ifdef CONFIG_INET_DIAG_DESTROY
 	.destroy	 = tcp_diag_destroy,
 #endif
+	.idiag_info_size = sizeof(struct tcp_info),
 };
 
 static int __init tcp_diag_init(void)

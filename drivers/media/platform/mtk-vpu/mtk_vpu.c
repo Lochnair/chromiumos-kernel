@@ -26,13 +26,6 @@
 
 #include "mtk_vpu.h"
 
-/**
- * VPU (video processor unit) is a tiny processor controlling video hardware
- * related to video codec, scaling and color format converting.
- * VPU interfaces with other blocks by share memory and interrupt.
- **/
-#define VPU_FW_VERSION		"1.0.6"
-
 #define INIT_TIMEOUT_MS		2000U
 #define IPI_TIMEOUT_MS		2000U
 #define VPU_IDLE_TIMEOUT_MS	1000U
@@ -556,61 +549,6 @@ static int load_requested_vpu(struct mtk_vpu *vpu,
 	return 0;
 }
 
-/**
- * vpu_compare_version - compare firmware version and expected version
- *
- * @vpu:			VPU driver data
- * @expected_version:	expected version
- *
- * Return: < 0 if firmware version is older than expected version
- *         = 0 if firmware version is equal to expected version
- *         > 0 if firmware version is newer than expected version
- **/
-static int vpu_compare_version(struct mtk_vpu *vpu,
-			       const char *expected_version)
-{
-	int cur_major, cur_minor, cur_build, cur_rel, cur_ver_num;
-	int major, minor, build, rel, ver_num;
-	char *cur_version = vpu->run.fw_ver;
-
-	cur_ver_num = sscanf(cur_version, "%d.%d.%d-rc%d",
-			     &cur_major, &cur_minor, &cur_build, &cur_rel);
-	if (cur_ver_num < 3)
-		return -1;
-	ver_num = sscanf(expected_version, "%d.%d.%d-rc%d",
-			 &major, &minor, &build, &rel);
-	if (ver_num < 3)
-		return -1;
-
-	if (cur_major < major)
-		return -1;
-	if (cur_major > major)
-		return 1;
-
-	if (cur_minor < minor)
-		return -1;
-	if (cur_minor > minor)
-		return 1;
-
-	if (cur_build < build)
-		return -1;
-	if (cur_build > build)
-		return 1;
-
-	if (cur_ver_num < ver_num)
-		return -1;
-	if (cur_ver_num > ver_num)
-		return 1;
-
-	if (ver_num > 3) {
-		if (cur_rel < rel)
-			return -1;
-		if (cur_rel > rel)
-			return 1;
-	}
-
-	return 0;
-}
 
 int vpu_load_firmware(struct platform_device *pdev)
 {
@@ -670,16 +608,6 @@ int vpu_load_firmware(struct platform_device *pdev)
 		goto OUT_LOAD_FW;
 	} else if (-ERESTARTSYS == ret) {
 		dev_err(dev, "wait vpu interrupted by a signal!\n");
-		goto OUT_LOAD_FW;
-	}
-
-	ret = vpu_compare_version(vpu, VPU_FW_VERSION);
-	if (ret < 0) {
-		dev_err(dev, "the current vpu fw version %s\n",
-			vpu->run.fw_ver);
-		dev_err(dev, "the expected vpu fw version %s\n",
-			VPU_FW_VERSION);
-		ret = -EINVAL;
 		goto OUT_LOAD_FW;
 	}
 

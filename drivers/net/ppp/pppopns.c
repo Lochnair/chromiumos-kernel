@@ -75,6 +75,10 @@ static int pppopns_recv_core(struct sock *sk_raw, struct sk_buff *skb)
 	__u32 now = jiffies;
 	struct header *hdr;
 
+	/* Fix up paged skbs. */
+	if (skb_linearize(skb) < 0)
+		goto drop;
+
 	/* Skip transport header */
 	skb_pull(skb, skb_transport_header(skb) - skb->data);
 

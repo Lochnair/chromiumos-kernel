@@ -1071,6 +1071,20 @@ static int rmi_populate(struct hid_device *hdev)
 	return 0;
 }
 
+static int rmi_open(struct input_dev *input)
+{
+	struct hid_device *hdev = input_get_drvdata(input);
+
+	return hid_hw_open(hdev);
+}
+
+static void rmi_close(struct input_dev *input)
+{
+	struct hid_device *hdev = input_get_drvdata(input);
+
+	hid_hw_close(hdev);
+}
+
 static int rmi_inhibit(struct input_dev *input)
 {
 	struct hid_device *hdev = input_get_drvdata(input);
@@ -1169,6 +1183,9 @@ static int rmi_input_configured(struct hid_device *hdev, struct hid_input *hi)
 			__set_bit(INPUT_PROP_BUTTONPAD, input->propbit);
 	}
 
+
+	input->open = rmi_open;
+	input->close = rmi_close;
 	input->inhibit = rmi_inhibit;
 	input->uninhibit = rmi_uninhibit;
 

@@ -29,6 +29,14 @@
 		interrupt-parent = <&pio>;
 		interrupts = <88 IRQ_TYPE_LEVEL_LOW>;
 	};
+
+	touchscreen3: touchscreen@20 {
+		compatible = "hid-over-i2c";
+		reg = <0x20>;
+		hid-descr-addr = <0x0020>;
+		interrupt-parent = <&pio>;
+		interrupts = <88 IRQ_TYPE_LEVEL_LOW>;
+	};
 };
 
 &mmc1 {

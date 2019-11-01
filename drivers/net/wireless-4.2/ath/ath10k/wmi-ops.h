@@ -200,6 +200,9 @@ struct wmi_ops {
 	struct sk_buff *(*gen_set_coex_param)(struct ath10k *ar,
 					      u32 wlan_traffic_priority);
 
+	struct sk_buff *(*gen_pdev_get_tpc_table_cmdid)(struct ath10k *ar,
+							u32 param);
+
 	struct sk_buff *(*gen_pdev_sa_disabled_ant_sel)(struct ath10k *ar,
 							u32 mode, u32 tx_ant,
 							u32 rx_ant);
@@ -222,6 +225,9 @@ struct wmi_ops {
 				u32 vdev_id, const u8 *mac_addr,
 				const struct wmi_peer_sant_set_train_arg *arg);
 #endif
+	struct sk_buff *(*gen_peer_cfr_capture_conf)(struct ath10k *ar,
+						     u32 vdev_id, const u8 *mac,
+						     const struct wmi_peer_cfr_capture_conf_arg *arg);
 };
 
 int ath10k_wmi_cmd_send(struct ath10k *ar, struct sk_buff *skb, u32 cmd_id);
@@ -1439,6 +1445,23 @@ ath10k_wmi_set_coex_param(struct ath10k *ar, u32 wlan_traffic_priority)
 }
 
 static inline int
+ath10k_wmi_pdev_get_tpc_table_cmdid(struct ath10k *ar, u32 param)
+{
+	struct sk_buff *skb;
+
+	if (!ar->wmi.ops->gen_pdev_get_tpc_table_cmdid)
+		return -EOPNOTSUPP;
+
+	skb = ar->wmi.ops->gen_pdev_get_tpc_table_cmdid(ar, param);
+
+	if (IS_ERR(skb))
+		return PTR_ERR(skb);
+
+	return ath10k_wmi_cmd_send(ar, skb,
+				   ar->wmi.cmd->pdev_get_tpc_table_cmdid);
+}
+
+static inline int
 ath10k_wmi_pdev_sa_disabled_ant_sel(struct ath10k *ar, u32 mode,
 				    u32 tx_ant, u32 rx_ant)
 {
@@ -1544,6 +1567,24 @@ ath10k_wmi_peer_set_smart_ant_train_info(
 
 	return ath10k_wmi_cmd_send(ar, skb,
 			ar->wmi.cmd->peer_set_smart_ant_train_info_cmdid);
+}
+
+static inline int
+ath10k_wmi_peer_set_cfr_capture_conf(struct ath10k *ar,
+				     u32 vdev_id, const u8 *mac,
+				     const struct wmi_peer_cfr_capture_conf_arg *arg)
+{
+	struct sk_buff *skb;
+
+	if (!ar->wmi.ops->gen_peer_cfr_capture_conf)
+		return -EOPNOTSUPP;
+
+	skb = ar->wmi.ops->gen_peer_cfr_capture_conf(ar, vdev_id, mac, arg);
+	if (IS_ERR(skb))
+		return PTR_ERR(skb);
+
+	return ath10k_wmi_cmd_send(ar, skb,
+				   ar->wmi.cmd->peer_set_cfr_capture_conf_cmdid);
 }
 #endif
 #endif

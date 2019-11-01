@@ -651,7 +651,7 @@ static void __fill_v4l2_buffer(struct vb2_buffer *vb, struct v4l2_buffer *b)
 	b->timestamp = vbuf->timestamp;
 	b->timecode = vbuf->timecode;
 	b->sequence = vbuf->sequence;
-	b->config_store = vbuf->config_store;
+	b->reserved2 = 0;
 	b->reserved = 0;
 
 	if (V4L2_TYPE_IS_MULTIPLANAR(q->type)) {
@@ -1318,8 +1318,6 @@ static void __fill_vb2_buffer(struct vb2_buffer *vb,
 		vbuf->flags &= ~V4L2_BUF_FLAG_TSTAMP_SRC_MASK;
 	}
 
-	vbuf->config_store = b->config_store;
-
 	if (V4L2_TYPE_IS_OUTPUT(b->type)) {
 		/*
 		 * For output buffers mask out the timecode flag:
@@ -1483,7 +1481,7 @@ static int __prepare_dmabuf(struct vb2_buffer *vb, const struct v4l2_buffer *b)
 			continue;
 		}
 
-		dprintk(1, "buffer for plane %d changed\n", plane);
+		dprintk(3, "buffer for plane %d changed\n", plane);
 
 		if (!reacquired) {
 			reacquired = true;
@@ -1713,7 +1711,7 @@ int vb2_prepare_buf(struct vb2_queue *q, struct v4l2_buffer *b)
 		/* Fill buffer information for the userspace */
 		__fill_v4l2_buffer(vb, b);
 
-		dprintk(1, "prepare of buffer %d succeeded\n", vb->index);
+		dprintk(2, "prepare of buffer %d succeeded\n", vb->index);
 	}
 	return ret;
 }
@@ -1854,7 +1852,7 @@ static int vb2_internal_qbuf(struct vb2_queue *q, struct v4l2_buffer *b)
 			return ret;
 	}
 
-	dprintk(1, "qbuf of buffer %d succeeded\n", vb->index);
+	dprintk(2, "qbuf of buffer %d succeeded\n", vb->index);
 	return 0;
 }
 
@@ -1929,7 +1927,7 @@ static int __vb2_wait_for_done_vb(struct vb2_queue *q, int nonblocking)
 		}
 
 		if (nonblocking) {
-			dprintk(1, "nonblocking and no buffers to dequeue, "
+			dprintk(3, "nonblocking and no buffers to dequeue, "
 								"will not wait\n");
 			return -EAGAIN;
 		}
@@ -2101,7 +2099,7 @@ static int vb2_internal_dqbuf(struct vb2_queue *q, struct v4l2_buffer *b,
 	/* go back to dequeued state */
 	__vb2_dqbuf(vb);
 
-	dprintk(1, "dqbuf of buffer %d, with state %d\n",
+	dprintk(2, "dqbuf of buffer %d, with state %d\n",
 			vb->index, vb->state);
 
 	return 0;

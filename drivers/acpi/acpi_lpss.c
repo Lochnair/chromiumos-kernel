@@ -641,7 +641,7 @@ static int acpi_lpss_platform_notify(struct notifier_block *nb,
 	}
 
 	switch (action) {
-	case BUS_NOTIFY_BOUND_DRIVER:
+	case BUS_NOTIFY_BIND_DRIVER:
 		if (pdata->dev_desc->flags & LPSS_SAVE_CTX)
 			dev_pm_domain_set(&pdev->dev, &acpi_lpss_pm_domain);
 		break;

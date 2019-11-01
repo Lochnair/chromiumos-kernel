@@ -60,6 +60,28 @@ static const struct inode_operations configfs_inode_operations ={
 	.setattr	= configfs_setattr,
 };
 
+static struct iattr *configfs_alloc_iattr(struct configfs_dirent *sd_parent,
+					  struct configfs_dirent *sd)
+{
+	struct iattr *sd_iattr;
+
+	sd_iattr = kzalloc(sizeof(struct iattr), GFP_KERNEL);
+	if (!sd_iattr)
+		return NULL;
+	/* assign default attributes */
+	sd_iattr->ia_mode = sd->s_mode;
+	if (sd_parent && sd_parent->s_iattr) {
+		sd_iattr->ia_uid = sd_parent->s_iattr->ia_uid;
+		sd_iattr->ia_gid = sd_parent->s_iattr->ia_gid;
+	} else {
+		sd_iattr->ia_uid = GLOBAL_ROOT_UID;
+		sd_iattr->ia_gid = GLOBAL_ROOT_GID;
+	}
+	sd_iattr->ia_atime = sd_iattr->ia_mtime =
+			sd_iattr->ia_ctime = CURRENT_TIME;
+	return sd_iattr;
+}
+
 int configfs_setattr(struct dentry * dentry, struct iattr * iattr)
 {
 	struct inode * inode = dentry->d_inode;
@@ -74,14 +96,9 @@ int configfs_setattr(struct dentry * dentry, struct iattr * iattr)
 	sd_iattr = sd->s_iattr;
 	if (!sd_iattr) {
 		/* setting attributes for the first time, allocate now */
-		sd_iattr = kzalloc(sizeof(struct iattr), GFP_KERNEL);
+		sd_iattr = configfs_alloc_iattr(NULL, sd);
 		if (!sd_iattr)
 			return -ENOMEM;
-		/* assign default attributes */
-		sd_iattr->ia_mode = sd->s_mode;
-		sd_iattr->ia_uid = GLOBAL_ROOT_UID;
-		sd_iattr->ia_gid = GLOBAL_ROOT_GID;
-		sd_iattr->ia_atime = sd_iattr->ia_mtime = sd_iattr->ia_ctime = CURRENT_TIME;
 		sd->s_iattr = sd_iattr;
 	}
 	/* attributes were changed atleast once in past */
@@ -189,6 +206,7 @@ int configfs_create(struct dentry * dentry, umode_t mode, int (*init)(struct ino
 	struct inode *inode = NULL;
 	struct configfs_dirent *sd;
 	struct inode *p_inode;
+	struct dentry *parent;
 
 	if (!dentry)
 		return -ENOENT;
@@ -197,6 +215,13 @@ int configfs_create(struct dentry * dentry, umode_t mode, int (*init)(struct ino
 		return -EEXIST;
 
 	sd = dentry->d_fsdata;
+	parent = dget_parent(dentry);
+	if (parent && !sd->s_iattr) {
+		sd->s_iattr = configfs_alloc_iattr(parent->d_fsdata, sd);
+		if (!sd->s_iattr)
+			return -ENOMEM;
+	}
+	dput(parent);
 	inode = configfs_new_inode(mode, sd, dentry->d_sb);
 	if (!inode)
 		return -ENOMEM;

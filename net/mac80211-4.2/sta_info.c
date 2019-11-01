@@ -299,6 +299,25 @@ static int sta_prepare_rate_control(struct ieee80211_local *local,
 	return 0;
 }
 
+/* Calculate the bc/mc receive frame burst size */
+void mc_bc_burst_size(struct sta_info *sta)
+{
+	/* Set the burst size as 5MTUs per rate */
+	if (sta->mc_rx_limit.rate)
+		sta->mc_rx_limit.burst_size =
+			skblen_to_ns(sta->mc_rx_limit.rate,
+				     sta->sdata->burst_size);
+	else
+		sta->mc_rx_limit.burst_size = 0;
+
+	if (sta->bc_rx_limit.rate)
+		sta->bc_rx_limit.burst_size =
+			skblen_to_ns(sta->bc_rx_limit.rate,
+				     sta->sdata->burst_size);
+	else
+		sta->bc_rx_limit.burst_size = 0;
+}
+
 struct sta_info *sta_info_alloc(struct ieee80211_sub_if_data *sdata,
 				const u8 *addr, gfp_t gfp)
 {
@@ -341,6 +360,13 @@ struct sta_info *sta_info_alloc(struct ieee80211_sub_if_data *sdata,
 	/* Mark TID as unreserved */
 	sta->reserved_tid = IEEE80211_TID_UNRESERVED;
 
+	/* Update the interface multicast and broadcast default RX rate
+	 * to STA RX limit
+	 */
+	sta->mc_rx_limit.rate = sdata->mc_rx_limit_rate;
+	sta->bc_rx_limit.rate = sdata->bc_rx_limit_rate;
+	/* Calculate the bc/mc receive frame burst size */
+	mc_bc_burst_size(sta);
 	ktime_get_ts(&uptime);
 	sta->last_connected = uptime.tv_sec;
 	ewma_init(&sta->avg_signal, 1024, 8);
@@ -1843,6 +1869,7 @@ void sta_set_sinfo(struct sta_info *sta, struct station_info *sinfo)
 			 BIT(NL80211_STA_INFO_RX_DROP_MISC) |
 			 BIT(NL80211_STA_INFO_BEACON_LOSS);
 
+	ewma_init(&sta->ave_data_rssi, 1024, 8);
 	ktime_get_ts(&uptime);
 	sinfo->connected_time = uptime.tv_sec - sta->last_connected;
 	sinfo->inactive_time = jiffies_to_msecs(jiffies - sta->last_rx);
@@ -2043,5 +2070,14 @@ void sta_set_sinfo(struct sta_info *sta, struct station_info *sinfo)
 	if (thr != 0) {
 		sinfo->filled |= BIT(NL80211_STA_INFO_EXPECTED_THROUGHPUT);
 		sinfo->expected_throughput = thr;
+	}
+	if (ieee80211_hw_check(&sta->local->hw, REPORTS_TX_ACK_STATUS)) {
+		if (!(sinfo->filled &
+			BIT_ULL(NL80211_STA_INFO_DATA_ACK_SIGNAL_AVG))) {
+			sinfo->avg_ack_rssi =
+			(s8) -ewma_read(&sta->ave_data_rssi);
+			sinfo->filled |=
+			BIT_ULL(NL80211_STA_INFO_DATA_ACK_SIGNAL_AVG);
+		}
 	}
 }

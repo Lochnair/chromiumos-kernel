@@ -347,6 +347,7 @@ gen7_render_ring_flush(struct drm_i915_gem_request *req,
 	if (flush_domains) {
 		flags |= PIPE_CONTROL_RENDER_TARGET_CACHE_FLUSH;
 		flags |= PIPE_CONTROL_DEPTH_CACHE_FLUSH;
+		flags |= PIPE_CONTROL_FLUSH_ENABLE;
 	}
 	if (invalidate_domains) {
 		flags |= PIPE_CONTROL_TLB_INVALIDATE;
@@ -418,6 +419,7 @@ gen8_render_ring_flush(struct drm_i915_gem_request *req,
 	if (flush_domains) {
 		flags |= PIPE_CONTROL_RENDER_TARGET_CACHE_FLUSH;
 		flags |= PIPE_CONTROL_DEPTH_CACHE_FLUSH;
+		flags |= PIPE_CONTROL_FLUSH_ENABLE;
 	}
 	if (invalidate_domains) {
 		flags |= PIPE_CONTROL_TLB_INVALIDATE;
@@ -1361,6 +1363,36 @@ gen6_add_request(struct drm_i915_gem_request *req)
 	return 0;
 }
 
+static int
+gen8_render_add_request(struct drm_i915_gem_request *req)
+{
+       struct intel_engine_cs *engine = req->ring;
+       int ret;
+
+       if (engine->semaphore.signal)
+               ret = engine->semaphore.signal(req, 8);
+       else
+               ret = intel_ring_begin(req, 8);
+       if (ret)
+               return ret;
+
+       intel_ring_emit(engine, GFX_OP_PIPE_CONTROL(6));
+       intel_ring_emit(engine, (PIPE_CONTROL_GLOBAL_GTT_IVB |
+                                PIPE_CONTROL_CS_STALL |
+                                PIPE_CONTROL_QW_WRITE));
+       intel_ring_emit(engine, intel_hws_seqno_address(req->ring));
+       intel_ring_emit(engine, 0);
+       intel_ring_emit(engine, i915_gem_request_get_seqno(req));
+       /* We're thrashing one dword of HWS. */
+       intel_ring_emit(engine, 0);
+       intel_ring_emit(engine, MI_USER_INTERRUPT);
+       intel_ring_emit(engine, MI_NOOP);
+       __intel_ring_advance(engine);
+
+       return 0;
+}
+
+
 static inline bool i915_gem_has_seqno_wrapped(struct drm_device *dev,
 					      u32 seqno)
 {
@@ -2031,14 +2063,14 @@ int intel_pin_and_map_ringbuffer_obj(struct drm_device *dev,
 	return 0;
 }
 
-void intel_destroy_ringbuffer_obj(struct intel_ringbuffer *ringbuf)
+static void intel_destroy_ringbuffer_obj(struct intel_ringbuffer *ringbuf)
 {
 	drm_gem_object_unreference(&ringbuf->obj->base);
 	ringbuf->obj = NULL;
 }
 
-int intel_alloc_ringbuffer_obj(struct drm_device *dev,
-			       struct intel_ringbuffer *ringbuf)
+static int intel_alloc_ringbuffer_obj(struct drm_device *dev,
+				      struct intel_ringbuffer *ringbuf)
 {
 	struct drm_i915_gem_object *obj;
 
@@ -2058,6 +2090,48 @@ int intel_alloc_ringbuffer_obj(struct drm_device *dev,
 	return 0;
 }
 
+struct intel_ringbuffer *
+intel_engine_create_ringbuffer(struct intel_engine_cs *engine, int size)
+{
+	struct intel_ringbuffer *ring;
+	int ret;
+
+	ring = kzalloc(sizeof(*ring), GFP_KERNEL);
+	if (ring == NULL)
+		return ERR_PTR(-ENOMEM);
+
+	ring->ring = engine;
+
+	ring->size = size;
+	/* Workaround an erratum on the i830 which causes a hang if
+	 * the TAIL pointer points to within the last 2 cachelines
+	 * of the buffer.
+	 */
+	ring->effective_size = size;
+	if (IS_I830(engine->dev) || IS_845G(engine->dev))
+		ring->effective_size -= 2 * CACHELINE_BYTES;
+
+	ring->last_retired_head = -1;
+	intel_ring_update_space(ring);
+
+	ret = intel_alloc_ringbuffer_obj(engine->dev, ring);
+	if (ret) {
+		DRM_ERROR("Failed to allocate ringbuffer %s: %d\n",
+			  engine->name, ret);
+		kfree(ring);
+		return ERR_PTR(ret);
+	}
+
+	return ring;
+}
+
+void
+intel_ringbuffer_free(struct intel_ringbuffer *ring)
+{
+	intel_destroy_ringbuffer_obj(ring);
+	kfree(ring);
+}
+
 static int intel_init_ring_buffer(struct drm_device *dev,
 				  struct intel_engine_cs *ring)
 {
@@ -2066,21 +2140,19 @@ static int intel_init_ring_buffer(struct drm_device *dev,
 
 	WARN_ON(ring->buffer);
 
-	ringbuf = kzalloc(sizeof(*ringbuf), GFP_KERNEL);
-	if (!ringbuf)
-		return -ENOMEM;
-	ring->buffer = ringbuf;
-
 	ring->dev = dev;
 	INIT_LIST_HEAD(&ring->active_list);
 	INIT_LIST_HEAD(&ring->request_list);
 	INIT_LIST_HEAD(&ring->execlist_queue);
 	i915_gem_batch_pool_init(dev, &ring->batch_pool);
-	ringbuf->size = 32 * PAGE_SIZE;
-	ringbuf->ring = ring;
 	memset(ring->semaphore.sync_seqno, 0, sizeof(ring->semaphore.sync_seqno));
 
 	init_waitqueue_head(&ring->irq_queue);
+
+	ringbuf = intel_engine_create_ringbuffer(ring, 32 * PAGE_SIZE);
+	if (IS_ERR(ringbuf))
+		return PTR_ERR(ringbuf);
+	ring->buffer = ringbuf;
 
 	if (I915_NEED_GFX_HWS(dev)) {
 		ret = init_status_page(ring);
@@ -2093,15 +2165,6 @@ static int intel_init_ring_buffer(struct drm_device *dev,
 			goto error;
 	}
 
-	WARN_ON(ringbuf->obj);
-
-	ret = intel_alloc_ringbuffer_obj(dev, ringbuf);
-	if (ret) {
-		DRM_ERROR("Failed to allocate ringbuffer %s: %d\n",
-				ring->name, ret);
-		goto error;
-	}
-
 	ret = intel_pin_and_map_ringbuffer_obj(dev, ringbuf);
 	if (ret) {
 		DRM_ERROR("Failed to pin and map ringbuffer %s: %d\n",
@@ -2110,14 +2173,6 @@ static int intel_init_ring_buffer(struct drm_device *dev,
 		goto error;
 	}
 
-	/* Workaround an erratum on the i830 which causes a hang if
-	 * the TAIL pointer points to within the last 2 cachelines
-	 * of the buffer.
-	 */
-	ringbuf->effective_size = ringbuf->size;
-	if (IS_I830(dev) || IS_845G(dev))
-		ringbuf->effective_size -= 2 * CACHELINE_BYTES;
-
 	ret = i915_cmd_parser_init_ring(ring);
 	if (ret)
 		goto error;
@@ -2125,7 +2180,7 @@ static int intel_init_ring_buffer(struct drm_device *dev,
 	return 0;
 
 error:
-	kfree(ringbuf);
+	intel_ringbuffer_free(ringbuf);
 	ring->buffer = NULL;
 	return ret;
 }
@@ -2133,19 +2188,18 @@ error:
 void intel_cleanup_ring_buffer(struct intel_engine_cs *ring)
 {
 	struct drm_i915_private *dev_priv;
-	struct intel_ringbuffer *ringbuf;
 
 	if (!intel_ring_initialized(ring))
 		return;
 
 	dev_priv = to_i915(ring->dev);
-	ringbuf = ring->buffer;
 
 	intel_stop_ring_buffer(ring);
 	WARN_ON(!IS_GEN2(ring->dev) && (I915_READ_MODE(ring) & MODE_IDLE) == 0);
 
-	intel_unpin_ringbuffer_obj(ringbuf);
-	intel_destroy_ringbuffer_obj(ringbuf);
+	intel_unpin_ringbuffer_obj(ring->buffer);
+	intel_ringbuffer_free(ring->buffer);
+	ring->buffer = NULL;
 
 	if (ring->cleanup)
 		ring->cleanup(ring);
@@ -2154,9 +2208,6 @@ void intel_cleanup_ring_buffer(struct intel_engine_cs *ring)
 
 	i915_cmd_parser_fini_ring(ring);
 	i915_gem_batch_pool_fini(&ring->batch_pool);
-
-	kfree(ringbuf);
-	ring->buffer = NULL;
 }
 
 static int ring_wait_for_space(struct intel_engine_cs *ring, int n)
@@ -2629,7 +2680,7 @@ int intel_init_render_ring_buffer(struct drm_device *dev)
 		}
 
 		ring->init_context = intel_rcs_ctx_init;
-		ring->add_request = gen6_add_request;
+		ring->add_request = gen8_render_add_request;
 		ring->flush = gen8_render_ring_flush;
 		ring->irq_get = gen8_ring_get_irq;
 		ring->irq_put = gen8_ring_put_irq;

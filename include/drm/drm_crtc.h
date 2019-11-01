@@ -44,7 +44,7 @@ struct drm_object_properties;
 struct drm_file;
 struct drm_clip_rect;
 struct device_node;
-struct fence;
+struct dma_fence;
 
 #define DRM_MODE_OBJECT_CRTC 0xcccccccc
 #define DRM_MODE_OBJECT_CONNECTOR 0xc0c0c0c0
@@ -888,7 +888,7 @@ struct drm_plane_state {
 
 	struct drm_crtc *crtc;   /* do not write directly, use drm_atomic_set_crtc_for_plane() */
 	struct drm_framebuffer *fb;  /* do not write directly, use drm_atomic_set_fb_for_plane() */
-	struct fence *fence;
+	struct dma_fence *fence;
 
 	/* Signed dest location allows it to be partially off screen */
 	int32_t crtc_x, crtc_y;

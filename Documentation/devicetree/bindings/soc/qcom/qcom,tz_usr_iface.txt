@@ -1,0 +1,31 @@
+QTI TZ_USER_INTERFACE
+
+TZ user interface driver provides the support to handle the XPU violations
+found by TZ, read or write the data from the user space.
+
+Required properties:
+- compatible: must contain "qti,tz-usr-iface"
+
+Optional properties:
+-qti,xpu-interrupt-support: indicates whether the driver should get the
+				interrupt if any XPU violation found
+
+Required child node properties if qti,xpu-interrupt-support property present:
+- interrupts: must contain the interrupt line information to be used
+- reg_val: must contain the TCSR WONCE register value
+
+Optional properties:
+
+- qti,panic-on-xpu-violation: indicates whether to panic the system if XPU
+				violation is found by TZ
+
+Example:
+	tz_usr_iface: qti,tzuserinterface {
+		compatible = "qti,tz-usr-iface";
+		qti,xpu-interrupt-support;
+		intr0 {
+			interrupts = <0 234 0>;
+			reg_val = <0x193D010>;
+			qti,panic-on-xpu-violation;
+		};
+	};

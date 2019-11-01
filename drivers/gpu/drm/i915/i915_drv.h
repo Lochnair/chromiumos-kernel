@@ -369,7 +369,8 @@ struct intel_link_m_n {
 
 void intel_link_compute_m_n(int bpp, int nlanes,
 			    int pixel_clock, int link_clock,
-			    struct intel_link_m_n *m_n);
+			    struct intel_link_m_n *m_n,
+			    bool reduce_m_n);
 
 /* Interface history:
  *
@@ -2420,6 +2421,14 @@ struct drm_i915_cmd_table {
 #define INTEL_DEVID(p)	(INTEL_INFO(p)->device_id)
 #define INTEL_REVID(p)	(__I915__(p)->dev->pdev->revision)
 
+/*
+ * Return true if revision is in range [since,until] inclusive.
+ *
+ * Use 0 for open-ended since, and REVID_FOREVER for open-ended until.
+ */
+#define IS_REVID(p, since, until) \
+	(INTEL_REVID(p) >= (since) && INTEL_REVID(p) <= (until))
+
 #define IS_I830(dev)		(INTEL_DEVID(dev) == 0x3577)
 #define IS_845G(dev)		(INTEL_DEVID(dev) == 0x2562)
 #define IS_I85X(dev)		(INTEL_INFO(dev)->is_i85x)
@@ -2486,17 +2495,21 @@ struct drm_i915_cmd_table {
 
 #define IS_PRELIMINARY_HW(intel_info) ((intel_info)->is_preliminary)
 
-#define SKL_REVID_A0		(0x0)
-#define SKL_REVID_B0		(0x1)
-#define SKL_REVID_C0		(0x2)
-#define SKL_REVID_D0		(0x3)
-#define SKL_REVID_E0		(0x4)
-#define SKL_REVID_F0		(0x5)
+#define SKL_REVID_A0		0x0
+#define SKL_REVID_B0		0x1
+#define SKL_REVID_C0		0x2
+#define SKL_REVID_D0		0x3
+#define SKL_REVID_E0		0x4
+#define SKL_REVID_F0		0x5
 
-#define BXT_REVID_A0		(0x0)
-#define BXT_REVID_B0		(0x3)
-#define BXT_REVID_C0		(0x6)
+#define IS_SKL_REVID(p, since, until) (IS_SKYLAKE(p) && IS_REVID(p, since, until))
 
+#define BXT_REVID_A0		0x0
+#define BXT_REVID_A1		0x1
+#define BXT_REVID_B0		0x3
+#define BXT_REVID_C0		0x9
+#define IS_BXT_REVID(dev_priv, since, until) \
+	(IS_BROXTON(dev_priv) && IS_REVID(dev_priv, since, until))
 /*
  * The genX designation typically refers to the render engine, so render
  * capability related checks should use IS_GEN, while display and other checks
@@ -2809,6 +2822,7 @@ void i915_gem_vma_destroy(struct i915_vma *vma);
 #define PIN_UPDATE	(1<<5)
 #define PIN_ZONE_4G	(1<<6)
 #define PIN_HIGH	(1<<7)
+#define PIN_OFFSET_FIXED	(1<<8)
 #define PIN_OFFSET_MASK (~4095)
 int __must_check
 i915_gem_object_pin(struct drm_i915_gem_object *obj,
@@ -2823,7 +2837,13 @@ i915_gem_object_ggtt_pin(struct drm_i915_gem_object *obj,
 
 int i915_vma_bind(struct i915_vma *vma, enum i915_cache_level cache_level,
 		  u32 flags);
+void __i915_vma_set_map_and_fenceable(struct i915_vma *vma);
 int __must_check i915_vma_unbind(struct i915_vma *vma);
+/*
+ * BEWARE: Do not use the function below unless you can _absolutely_
+ * _guarantee_ VMA in question is _not in use_ anywhere.
+ */
+int __must_check __i915_vma_unbind_no_wait(struct i915_vma *vma);
 int i915_gem_object_put_pages(struct drm_i915_gem_object *obj);
 void i915_gem_release_all_mmaps(struct drm_i915_private *dev_priv);
 void i915_gem_release_mmap(struct drm_i915_gem_object *obj);
@@ -2837,6 +2857,9 @@ static inline int __sg_page_count(struct scatterlist *sg)
 {
 	return sg->length >> PAGE_SHIFT;
 }
+
+struct page *
+i915_gem_object_get_dirty_page(struct drm_i915_gem_object *obj, int n);
 
 static inline struct page *
 i915_gem_object_get_page(struct drm_i915_gem_object *obj, int n)
@@ -2905,11 +2928,6 @@ static inline bool i915_gem_request_completed(struct drm_i915_gem_request *req,
 
 int __must_check i915_gem_get_seqno(struct drm_device *dev, u32 *seqno);
 int __must_check i915_gem_set_seqno(struct drm_device *dev, u32 seqno);
-int __must_check i915_gem_object_get_fence(struct drm_i915_gem_object *obj);
-int __must_check i915_gem_object_put_fence(struct drm_i915_gem_object *obj);
-
-bool i915_gem_object_pin_fence(struct drm_i915_gem_object *obj);
-void i915_gem_object_unpin_fence(struct drm_i915_gem_object *obj);
 
 struct drm_i915_gem_request *
 i915_gem_find_active_request(struct intel_engine_cs *ring);
@@ -3005,15 +3023,11 @@ struct drm_gem_object *i915_gem_prime_import(struct drm_device *dev,
 struct dma_buf *i915_gem_prime_export(struct drm_device *dev,
 				struct drm_gem_object *gem_obj, int flags);
 
-void i915_gem_restore_fences(struct drm_device *dev);
-
-unsigned long
-i915_gem_obj_ggtt_offset_view(struct drm_i915_gem_object *o,
-			      const struct i915_ggtt_view *view);
-unsigned long
-i915_gem_obj_offset(struct drm_i915_gem_object *o,
-		    struct i915_address_space *vm);
-static inline unsigned long
+u64 i915_gem_obj_ggtt_offset_view(struct drm_i915_gem_object *o,
+				  const struct i915_ggtt_view *view);
+u64 i915_gem_obj_offset(struct drm_i915_gem_object *o,
+			struct i915_address_space *vm);
+static inline u64
 i915_gem_obj_ggtt_offset(struct drm_i915_gem_object *o)
 {
 	return i915_gem_obj_ggtt_offset_view(o, &i915_ggtt_view_normal);
@@ -3101,6 +3115,19 @@ i915_gem_object_ggtt_unpin(struct drm_i915_gem_object *obj)
 	i915_gem_object_ggtt_unpin_view(obj, &i915_ggtt_view_normal);
 }
 
+/* i915_gem_fence.c */
+int __must_check i915_gem_object_get_fence(struct drm_i915_gem_object *obj);
+int __must_check i915_gem_object_put_fence(struct drm_i915_gem_object *obj);
+
+bool i915_gem_object_pin_fence(struct drm_i915_gem_object *obj);
+void i915_gem_object_unpin_fence(struct drm_i915_gem_object *obj);
+
+void i915_gem_restore_fences(struct drm_device *dev);
+
+void i915_gem_detect_bit_6_swizzle(struct drm_device *dev);
+void i915_gem_object_do_bit_17_swizzle(struct drm_i915_gem_object *obj);
+void i915_gem_object_save_bit_17_swizzle(struct drm_i915_gem_object *obj);
+
 /* i915_gem_context.c */
 int __must_check i915_gem_context_init(struct drm_device *dev);
 void i915_gem_context_fini(struct drm_device *dev);
@@ -3147,6 +3174,7 @@ int __must_check i915_gem_evict_something(struct drm_device *dev,
 					  unsigned long start,
 					  unsigned long end,
 					  unsigned flags);
+int __must_check i915_gem_evict_for_vma(struct i915_vma *target);
 int i915_gem_evict_vm(struct i915_address_space *vm, bool do_idle);
 int i915_gem_evict_everything(struct drm_device *dev);
 
@@ -3161,6 +3189,10 @@ static inline void i915_gem_chipset_flush(struct drm_device *dev)
 int i915_gem_stolen_insert_node(struct drm_i915_private *dev_priv,
 				struct drm_mm_node *node, u64 size,
 				unsigned alignment);
+int i915_gem_stolen_insert_node_in_range(struct drm_i915_private *dev_priv,
+					 struct drm_mm_node *node, u64 size,
+					 unsigned alignment, u64 start,
+					 u64 end);
 void i915_gem_stolen_remove_node(struct drm_i915_private *dev_priv,
 				 struct drm_mm_node *node);
 int i915_gem_init_stolen(struct drm_device *dev);
@@ -3193,10 +3225,6 @@ static inline bool i915_gem_object_needs_bit17_swizzle(struct drm_i915_gem_objec
 	return dev_priv->mm.bit_6_swizzle_x == I915_BIT_6_SWIZZLE_9_10_17 &&
 		obj->tiling_mode != I915_TILING_NONE;
 }
-
-void i915_gem_detect_bit_6_swizzle(struct drm_device *dev);
-void i915_gem_object_do_bit_17_swizzle(struct drm_i915_gem_object *obj);
-void i915_gem_object_save_bit_17_swizzle(struct drm_i915_gem_object *obj);
 
 /* i915_gem_debug.c */
 #if WATCH_LISTS
@@ -3352,6 +3380,8 @@ extern void intel_display_print_error_state(struct drm_i915_error_state_buf *e,
 
 int sandybridge_pcode_read(struct drm_i915_private *dev_priv, u32 mbox, u32 *val);
 int sandybridge_pcode_write(struct drm_i915_private *dev_priv, u32 mbox, u32 val);
+int skl_pcode_request(struct drm_i915_private *dev_priv, u32 mbox, u32 request,
+		      u32 reply_mask, u32 reply, int timeout_base_ms);
 
 /* intel_sideband.c */
 u32 vlv_punit_read(struct drm_i915_private *dev_priv, u32 addr);
@@ -3439,11 +3469,6 @@ static inline uint32_t i915_vgacntrl_reg(struct drm_device *dev)
 		return CPU_VGACNTRL;
 	else
 		return VGACNTRL;
-}
-
-static inline void __user *to_user_ptr(u64 address)
-{
-	return (void __user *)(uintptr_t)address;
 }
 
 static inline unsigned long msecs_to_jiffies_timeout(const unsigned int m)

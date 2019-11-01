@@ -663,6 +663,109 @@ bool cfg80211_rx_mgmt(struct wireless_dev *wdev, int freq, int sig_mbm,
 	return result;
 }
 EXPORT_SYMBOL(cfg80211_rx_mgmt);
+ 
+void cfg80211_sched_dfs_chan_update(struct cfg80211_registered_device *rdev)
+{
+	cancel_delayed_work(&rdev->dfs_update_channels_wk);
+	queue_delayed_work(cfg80211_wq, &rdev->dfs_update_channels_wk, 0);
+}
+
+static bool cfg80211_5ghz_sub_chan(struct cfg80211_chan_def *chandef,
+				   struct ieee80211_channel *chan)
+{
+	u32 start_freq_seg0 = 0, end_freq_seg0 = 0;
+	u32 start_freq_seg1 = 0, end_freq_seg1 = 0;
+
+	if (chandef->chan->center_freq == chan->center_freq)
+		return true;
+
+	switch (chandef->width) {
+	case NL80211_CHAN_WIDTH_40:
+		start_freq_seg0 = chandef->center_freq1 - 20;
+		end_freq_seg0 = chandef->center_freq1 + 20;
+		break;
+	case NL80211_CHAN_WIDTH_80P80:
+		start_freq_seg1 = chandef->center_freq2 - 40;
+		end_freq_seg1 = chandef->center_freq2 + 40;
+		/* fall through */
+	case NL80211_CHAN_WIDTH_80:
+		start_freq_seg0 = chandef->center_freq1 - 40;
+		end_freq_seg0 = chandef->center_freq1 + 40;
+		break;
+	case NL80211_CHAN_WIDTH_160:
+		start_freq_seg0 = chandef->center_freq1 - 80;
+		end_freq_seg0 = chandef->center_freq1 + 80;
+		break;
+	case NL80211_CHAN_WIDTH_20_NOHT:
+	case NL80211_CHAN_WIDTH_20:
+	case NL80211_CHAN_WIDTH_5:
+	case NL80211_CHAN_WIDTH_10:
+		break;
+	}
+
+	if (chan->center_freq > start_freq_seg0 &&
+	    chan->center_freq < end_freq_seg0)
+		return true;
+
+	return chan->center_freq > start_freq_seg1 &&
+		chan->center_freq < end_freq_seg1;
+}
+
+static bool cfg80211_beaconing_iface_active(struct wireless_dev *wdev)
+{
+	bool active = false;
+
+	if (!wdev->chandef.chan)
+		return false;
+
+	switch (wdev->iftype) {
+	case NL80211_IFTYPE_AP:
+	case NL80211_IFTYPE_P2P_GO:
+		active = wdev->beacon_interval != 0;
+		break;
+	case NL80211_IFTYPE_ADHOC:
+		active = wdev->ssid_len != 0;
+		break;
+	case NL80211_IFTYPE_MESH_POINT:
+		active = wdev->mesh_id_len != 0;
+		break;
+	case NL80211_IFTYPE_STATION:
+	case NL80211_IFTYPE_OCB:
+	case NL80211_IFTYPE_P2P_CLIENT:
+	case NL80211_IFTYPE_MONITOR:
+	case NL80211_IFTYPE_AP_VLAN:
+	case NL80211_IFTYPE_WDS:
+	case NL80211_IFTYPE_P2P_DEVICE:
+		break;
+	case NL80211_IFTYPE_UNSPECIFIED:
+	case NUM_NL80211_IFTYPES:
+		WARN_ON(1);
+	}
+
+	return active;
+}
+
+static bool cfg80211_5ghz_is_wiphy_oper_chan(struct wiphy *wiphy,
+					     struct ieee80211_channel *chan)
+{
+	struct wireless_dev *wdev;
+	struct cfg80211_registered_device *rdev = wiphy_to_rdev(wiphy);
+
+	bool ret = false;
+
+	ASSERT_RTNL();
+
+	list_for_each_entry(wdev, &rdev->wdev_list, list) {
+		if (!cfg80211_beaconing_iface_active(wdev))
+			continue;
+
+		if (cfg80211_5ghz_sub_chan(&wdev->chandef, chan))
+			return true;
+	}
+
+	return ret;
+}
+
 
 void cfg80211_dfs_channels_update_work(struct work_struct *work)
 {
@@ -674,6 +777,8 @@ void cfg80211_dfs_channels_update_work(struct work_struct *work)
 	struct wiphy *wiphy;
 	bool check_again = false;
 	unsigned long timeout, next_time = 0;
+	unsigned long time_dfs_update;
+	enum nl80211_radar_event radar_event;
 	int bandid, i;
 
 	delayed_work = container_of(work, struct delayed_work, work);
@@ -690,11 +795,28 @@ void cfg80211_dfs_channels_update_work(struct work_struct *work)
 		for (i = 0; i < sband->n_channels; i++) {
 			c = &sband->channels[i];
 
-			if (c->dfs_state != NL80211_DFS_UNAVAILABLE)
+			if (!(c->flags & IEEE80211_CHAN_RADAR))
 				continue;
 
-			timeout = c->dfs_state_entered + msecs_to_jiffies(
-					IEEE80211_DFS_MIN_NOP_TIME_MS);
+			if (c->dfs_state != NL80211_DFS_UNAVAILABLE &&
+			    c->dfs_state != NL80211_DFS_AVAILABLE)
+				continue;
+
+			if (c->dfs_state == NL80211_DFS_UNAVAILABLE) {
+				time_dfs_update = IEEE80211_DFS_MIN_NOP_TIME_MS;
+				radar_event = NL80211_RADAR_NOP_FINISHED;
+			} else {
+				if (regulatory_pre_cac_allowed(wiphy) ||
+				    cfg80211_5ghz_is_wiphy_oper_chan(wiphy, c))
+					continue;
+
+				time_dfs_update =
+					regulatory_get_pre_cac_timeout(wiphy);
+				radar_event = NL80211_RADAR_PRE_CAC_EXPIRED;
+			}
+
+			timeout = c->dfs_state_entered +
+				  msecs_to_jiffies(time_dfs_update);
 
 			if (time_after_eq(jiffies, timeout)) {
 				c->dfs_state = NL80211_DFS_USABLE;
@@ -704,8 +826,8 @@ void cfg80211_dfs_channels_update_work(struct work_struct *work)
 							NL80211_CHAN_NO_HT);
 
 				nl80211_radar_notify(rdev, &chandef,
-						     NL80211_RADAR_NOP_FINISHED,
-						     NULL, GFP_ATOMIC);
+						     radar_event, NULL,
+						     GFP_ATOMIC);
 				continue;
 			}
 
@@ -730,7 +852,6 @@ void cfg80211_radar_event(struct wiphy *wiphy,
 			  gfp_t gfp)
 {
 	struct cfg80211_registered_device *rdev = wiphy_to_rdev(wiphy);
-	unsigned long timeout;
 
 	trace_cfg80211_radar_event(wiphy, chandef);
 
@@ -740,9 +861,7 @@ void cfg80211_radar_event(struct wiphy *wiphy,
 	 */
 	cfg80211_set_dfs_state(wiphy, chandef, NL80211_DFS_UNAVAILABLE);
 
-	timeout = msecs_to_jiffies(IEEE80211_DFS_MIN_NOP_TIME_MS);
-	queue_delayed_work(cfg80211_wq, &rdev->dfs_update_channels_wk,
-			   timeout);
+	cfg80211_sched_dfs_chan_update(rdev);
 
 	nl80211_radar_notify(rdev, chandef, NL80211_RADAR_DETECTED, NULL, gfp);
 }
@@ -771,6 +890,7 @@ void cfg80211_cac_event(struct net_device *netdev,
 			  msecs_to_jiffies(wdev->cac_time_ms);
 		WARN_ON(!time_after_eq(jiffies, timeout));
 		cfg80211_set_dfs_state(wiphy, chandef, NL80211_DFS_AVAILABLE);
+		cfg80211_sched_dfs_chan_update(rdev);
 		break;
 	case NL80211_RADAR_CAC_ABORTED:
 		break;

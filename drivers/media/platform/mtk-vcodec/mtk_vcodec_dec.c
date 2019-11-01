@@ -1105,6 +1105,8 @@ static void vb2ops_vdec_buf_queue(struct vb2_buffer *vb)
 			ctx->state = MTK_STATE_HEADER;
 			mtk_v4l2_debug(1, "[%d] dpbsize=%d", ctx->id,
 					ctx->dpb_size);
+
+			mtk_vdec_queue_res_chg_event(ctx);
 		} else {
 			mtk_v4l2_debug(3, "[%d] already init driver %d",
 					ctx->id, ctx->state);
@@ -1301,6 +1303,11 @@ int mtk_vcodec_dec_ctrls_setup(struct mtk_vcodec_ctx *ctx)
 				V4L2_CID_MIN_BUFFERS_FOR_CAPTURE,
 				1, 32, 1, 1);
 	ctrl->flags |= V4L2_CTRL_FLAG_VOLATILE;
+	v4l2_ctrl_new_std_menu(&ctx->ctrl_hdl,
+				&mtk_vcodec_dec_ctrl_ops,
+				V4L2_CID_MPEG_VIDEO_VP9_PROFILE,
+				V4L2_MPEG_VIDEO_VP9_PROFILE_0,
+				0, V4L2_MPEG_VIDEO_VP9_PROFILE_0);
 
 	if (ctx->ctrl_hdl.error) {
 		mtk_v4l2_err("Adding control failed %d",

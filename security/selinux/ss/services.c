@@ -73,6 +73,7 @@
 int selinux_policycap_netpeer;
 int selinux_policycap_openperm;
 int selinux_policycap_alwaysnetwork;
+int selinux_policycap_nnp_nosuid_transition;
 
 static DEFINE_RWLOCK(policy_rwlock);
 
@@ -1994,6 +1995,9 @@ static void security_load_policycaps(void)
 						  POLICYDB_CAPABILITY_OPENPERM);
 	selinux_policycap_alwaysnetwork = ebitmap_get_bit(&policydb.policycaps,
 						  POLICYDB_CAPABILITY_ALWAYSNETWORK);
+	selinux_policycap_nnp_nosuid_transition =
+		ebitmap_get_bit(&policydb.policycaps,
+				POLICYDB_CAPABILITY_NNP_NOSUID_TRANSITION);
 }
 
 static int security_preserve_bools(struct policydb *p);

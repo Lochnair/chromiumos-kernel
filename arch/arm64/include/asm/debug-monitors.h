@@ -18,6 +18,12 @@
 
 #ifdef __KERNEL__
 
+#include <linux/errno.h>
+#include <linux/types.h>
+#include <asm/esr.h>
+#include <asm/insn.h>
+#include <asm/ptrace.h>
+
 /* Low-level stepping controls. */
 #define DBG_MDSCR_SS		(1 << 0)
 #define DBG_SPSR_SS		(1 << 21)
@@ -38,12 +44,13 @@
 /*
  * Break point instruction encoding
  */
-#define BREAK_INSTR_SIZE		4
+#define BREAK_INSTR_SIZE		AARCH64_INSN_SIZE
 
 /*
  * ESR values expected for dynamic and compile time BRK instruction
  */
-#define DBG_ESR_VAL_BRK(x)	(0xf2000000 | ((x) & 0xfffff))
+#define DBG_ESR_VAL_BRK(x) \
+	((ESR_ELx_EC_BRK64 << ESR_ELx_EC_SHIFT) | ESR_ELx_IL | ((x) & 0xffff))
 
 /*
  * #imm16 values used for BRK instruction generation

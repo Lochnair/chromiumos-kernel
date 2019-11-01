@@ -21,11 +21,13 @@
 #include <linux/utsname.h>
 #include <linux/crc32.h>
 #include <linux/firmware.h>
+#include <linux/devcoredump.h>
 
 #include "core.h"
 #include "debug.h"
 #include "hif.h"
 #include "wmi-ops.h"
+#include "mac.h"
 
 /* ms */
 #define ATH10K_DEBUG_HTT_STATS_INTERVAL 1000
@@ -711,7 +713,8 @@ ath10k_debug_get_new_fw_crash_data(struct ath10k *ar)
 }
 EXPORT_SYMBOL(ath10k_debug_get_new_fw_crash_data);
 
-static struct ath10k_dump_file_data *ath10k_build_dump_file(struct ath10k *ar)
+static struct ath10k_dump_file_data *ath10k_build_dump_file(struct ath10k *ar,
+							    bool mark_read)
 {
 	struct ath10k_fw_crash_data *crash_data = ar->debug.fw_crash_data;
 	struct ath10k_dump_file_data *dump_data;
@@ -780,11 +783,44 @@ static struct ath10k_dump_file_data *ath10k_build_dump_file(struct ath10k *ar)
 	       sizeof(crash_data->registers));
 	sofar += sizeof(*dump_tlv) + sizeof(crash_data->registers);
 
-	ar->debug.fw_crash_data->crashed_since_read = false;
+	ar->debug.fw_crash_data->crashed_since_read = !mark_read;
 
 	spin_unlock_bh(&ar->data_lock);
 
 	return dump_data;
+}
+
+int ath10k_debug_fw_devcoredump(struct ath10k *ar)
+{
+	struct ath10k_dump_file_data *dump;
+	void *dump_ptr;
+	u32 dump_len;
+
+	/* To keep the dump file available also for debugfs don't mark the
+	 * file read, only debugfs should do that.
+	 */
+	dump = ath10k_build_dump_file(ar, false);
+	if (!dump) {
+		ath10k_warn(ar, "no crash dump data found for devcoredump");
+		return -ENODATA;
+	}
+
+	/* Make a copy of the dump file for dev_coredumpv() as during the
+	 * transition period we need to own the original file. Once
+	 * fw_crash_dump debugfs file is removed no need to have a copy
+	 * anymore.
+	 */
+	dump_len = le32_to_cpu(dump->len);
+	dump_ptr = vzalloc(dump_len);
+
+	if (!dump_ptr)
+		return -ENOMEM;
+
+	memcpy(dump_ptr, dump, dump_len);
+
+	dev_coredumpv(ar->dev, dump_ptr, dump_len, GFP_KERNEL);
+
+	return 0;
 }
 
 static int ath10k_fw_crash_dump_open(struct inode *inode, struct file *file)
@@ -792,7 +828,9 @@ static int ath10k_fw_crash_dump_open(struct inode *inode, struct file *file)
 	struct ath10k *ar = inode->i_private;
 	struct ath10k_dump_file_data *dump;
 
-	dump = ath10k_build_dump_file(ar);
+	ath10k_warn(ar, "fw_crash_dump debugfs file is deprecated, please use /sys/class/devcoredump instead.");
+
+	dump = ath10k_build_dump_file(ar, true);
 	if (!dump)
 		return -ENODATA;
 
@@ -1859,7 +1897,7 @@ static void ath10k_tpc_stats_fill(struct ath10k *ar,
 			 tpc_stats->num_tx_chain,
 			 tpc_stats->rate_max);
 
-	for (j = 0; j < tpc_stats->num_tx_chain ; j++) {
+	for (j = 0; j < WMI_TPC_FLAG; j++) {
 		switch (j) {
 		case WMI_TPC_TABLE_TYPE_CDD:
 			if (tpc_stats->flag[j] == ATH10K_TPC_TABLE_TYPE_FLAG) {
@@ -2014,95 +2052,110 @@ static const struct file_operations fops_atf_enable = {
 	.llseek = default_llseek,
 };
 
-static ssize_t ath10k_write_atf_threshold(struct file *file,
-					  const char __user *user_buf,
-					  size_t count, loff_t *ppos)
+static ssize_t ath10k_write_atf_param(struct file *file,
+				      const char __user *user_buf,
+				      size_t count, loff_t *ppos)
 {
 	struct ath10k *ar = file->private_data;
-	int ret;
-	u32 threshold;
+	int ret, len;
+	char buf[500];
+	u32 temp, tid;
 
-	if (kstrtou32_from_user(user_buf, count, 0, &threshold))
+	if (count > sizeof(buf))
 		return -EINVAL;
+
+	if (copy_from_user(buf, user_buf, count))
+		return -EFAULT;
+
+	buf[sizeof(buf) - 1] = '\0';
+	len = strlen(buf);
+
+	if (len > 0 && buf[len - 1] == '\n')
+		buf[len - 1] = 0;
+
+	ret = count;
 	mutex_lock(&ar->conf_mutex);
 	spin_lock_bh(&ar->txqs_lock);
-	if (ar->airtime_inflight_max == threshold) {
-		ret = count;
+
+	if (sscanf(buf, "interval %u", &temp) == 1) {
+		ar->atf_sch_interval =  temp;
 		goto exit;
+	} else if (sscanf(buf, "max_inflight_airtime %u", &temp) == 1) {
+		ar->airtime_inflight_max = temp;
+		goto exit;
+	} else if (sscanf(buf, "release_limit %u", &temp) == 1) {
+		ar->atf_release_limit = temp;
+		goto exit;
+	} else if (sscanf(buf, "quantum %u %u", &tid, &temp) == 2) {
+		if (tid < IEEE80211_NUM_TIDS)
+			ar->atf_quantum[tid] =  temp;
+		goto exit;
+	} else if (sscanf(buf, "quantum_mesh %u %u", &tid, &temp) == 2) {
+		if (tid < IEEE80211_NUM_TIDS)
+			ar->atf_quantum_mesh[tid] = temp;
+		goto exit;
+	} else if (sscanf(buf, "txq_limit_min %u %u", &tid, &temp) == 2) {
+		if (tid < IEEE80211_NUM_TIDS)
+			ar->atf_txq_limit_min[tid] = temp;
+		goto exit;
+	} else if (sscanf(buf, "txq_limit_max %u %u", &tid, &temp) == 2) {
+		if (tid < IEEE80211_NUM_TIDS)
+			ar->atf_txq_limit_max[tid] = temp;
+		goto exit;
+	} else {
+		ret = -EINVAL;
 	}
 
-	ar->airtime_inflight_max = threshold;
-	ret = count;
 exit:
 	spin_unlock_bh(&ar->txqs_lock);
 	mutex_unlock(&ar->conf_mutex);
 	return ret;
 }
 
-static ssize_t ath10k_read_atf_threshold(struct file *file,
-					 char __user *user_buf,
+static ssize_t ath10k_read_atf_param(struct file *file,
+				     char __user *user_buf,
 					 size_t count, loff_t *ppos)
 {
 	struct ath10k *ar = file->private_data;
 	int len = 0;
-	char buf[32];
+	char buf[500];
 
-	len = scnprintf(buf, sizeof(buf) - len, "%d\n",
-			ar->airtime_inflight_max);
-
-	return simple_read_from_buffer(user_buf, count, ppos, buf, len);
-}
-
-static const struct file_operations fops_atf_threshold = {
-	.read = ath10k_read_atf_threshold,
-	.write = ath10k_write_atf_threshold,
-	.open = simple_open,
-	.owner = THIS_MODULE,
-	.llseek = default_llseek,
-};
-
-static ssize_t ath10k_write_atf_release_limit(struct file *file,
-					      const char __user *user_buf,
-					      size_t count, loff_t *ppos)
-{
-	struct ath10k *ar = file->private_data;
-	int ret;
-	u32 max;
-
-	if (kstrtou32_from_user(user_buf, count, 0, &max))
-		return -EINVAL;
 	mutex_lock(&ar->conf_mutex);
-	spin_lock_bh(&ar->txqs_lock);
-	if (ar->atf_release_limit == max) {
-		ret = count;
-		goto exit;
-	}
+	len = scnprintf(buf, sizeof(buf),
+			"interval %u\n"
+			"max_inflight_airtime %u\n"
+			"release_limit %u\n"
+			"quantum %u %u %u %u %u %u %u %u\n"
+			"quantum_mesh %u %u %u %u %u %u %u %u\n"
+			"txq_limit_min %u %u %u %u %u %u %u %u\n"
+			"txq_limit_max %u %u %u %u %u %u %u %u\n",
+			ar->atf_sch_interval,
+			ar->airtime_inflight_max,
+			ar->atf_release_limit,
+			ar->atf_quantum[0], ar->atf_quantum[1],
+			ar->atf_quantum[2], ar->atf_quantum[3],
+			ar->atf_quantum[4], ar->atf_quantum[5],
+			ar->atf_quantum[6], ar->atf_quantum[7],
+			ar->atf_quantum_mesh[0], ar->atf_quantum_mesh[1],
+			ar->atf_quantum_mesh[2], ar->atf_quantum_mesh[3],
+			ar->atf_quantum_mesh[4], ar->atf_quantum_mesh[5],
+			ar->atf_quantum_mesh[6], ar->atf_quantum_mesh[7],
+			ar->atf_txq_limit_min[0], ar->atf_txq_limit_min[1],
+			ar->atf_txq_limit_min[2], ar->atf_txq_limit_min[3],
+			ar->atf_txq_limit_min[4], ar->atf_txq_limit_min[5],
+			ar->atf_txq_limit_min[6], ar->atf_txq_limit_min[7],
+			ar->atf_txq_limit_max[0], ar->atf_txq_limit_max[1],
+			ar->atf_txq_limit_max[2], ar->atf_txq_limit_max[3],
+			ar->atf_txq_limit_max[4], ar->atf_txq_limit_max[5],
+			ar->atf_txq_limit_max[6], ar->atf_txq_limit_max[7]);
 
-	ar->atf_release_limit = max;
-	ret = count;
-exit:
-	spin_unlock_bh(&ar->txqs_lock);
 	mutex_unlock(&ar->conf_mutex);
-	return ret;
-}
-
-static ssize_t ath10k_read_atf_release_limit(struct file *file,
-					     char __user *user_buf,
-					     size_t count, loff_t *ppos)
-{
-	struct ath10k *ar = file->private_data;
-	int len = 0;
-	char buf[32];
-
-	len = scnprintf(buf, sizeof(buf) - len, "%d\n",
-			ar->atf_release_limit);
-
 	return simple_read_from_buffer(user_buf, count, ppos, buf, len);
 }
 
-static const struct file_operations fops_atf_release_limit = {
-	.read = ath10k_read_atf_release_limit,
-	.write = ath10k_write_atf_release_limit,
+static const struct file_operations fops_atf_param = {
+	.read = ath10k_read_atf_param,
+	.write = ath10k_write_atf_param,
 	.open = simple_open,
 	.owner = THIS_MODULE,
 	.llseek = default_llseek,
@@ -2618,6 +2671,74 @@ static const struct file_operations fops_btcoex_priority = {
 	.open = simple_open
 };
 
+static ssize_t ath10k_write_cfr_enable(struct file *file,
+				       const char __user *user_buf,
+				       size_t count, loff_t *ppos)
+{
+	struct ath10k *ar = file->private_data;
+	u8 cfr_enable;
+	u32 param;
+	int ret;
+
+	if (kstrtou8_from_user(user_buf, count, 0, &cfr_enable))
+		return -EINVAL;
+
+	mutex_lock(&ar->conf_mutex);
+
+	if (ar->state != ATH10K_STATE_ON) {
+		ret = -ENETDOWN;
+		goto exit;
+	}
+
+	if (cfr_enable > 1 || cfr_enable < 0) {
+		ret = -EINVAL;
+		goto exit;
+	}
+
+	if (ar->cfr_enable == cfr_enable) {
+		ret = count;
+		goto exit;
+	}
+
+	param = ar->wmi.pdev_param->enable_cfr_capture;
+	ret = ath10k_wmi_pdev_set_param(ar, param, cfr_enable);
+	if (ret) {
+		ath10k_warn(ar, "CFR capture enable failed from debugfs: %d\n",
+			    ret);
+		goto exit;
+	}
+
+	ar->cfr_enable = cfr_enable;
+
+	ret = count;
+
+exit:
+	mutex_unlock(&ar->conf_mutex);
+
+	return ret;
+}
+
+static ssize_t ath10k_read_cfr_enable(struct file *file, char __user *user_buf,
+				      size_t count, loff_t *ppos)
+{
+	struct ath10k *ar = file->private_data;
+	int len = 0;
+	char buf[32];
+
+	len = scnprintf(buf, sizeof(buf) - len, "%d\n",
+			ar->cfr_enable);
+
+	return simple_read_from_buffer(user_buf, count, ppos, buf, len);
+}
+
+static const struct file_operations fops_cfr_enable = {
+	.read = ath10k_read_cfr_enable,
+	.write = ath10k_write_cfr_enable,
+	.open = simple_open,
+	.owner = THIS_MODULE,
+	.llseek = default_llseek,
+};
+
 static ssize_t ath10k_write_disable_peer_stats(struct file *file,
 					       const char __user *ubuf,
 					       size_t count, loff_t *ppos)
@@ -2864,6 +2985,165 @@ static const struct file_operations fops_ps_state_enable = {
 	.llseek = default_llseek,
 };
 
+static int ath10k_debug_tpc_stats_final_request(struct ath10k *ar)
+{
+	int ret;
+	unsigned long time_left;
+
+	lockdep_assert_held(&ar->conf_mutex);
+
+	reinit_completion(&ar->debug.tpc_complete);
+
+	ret = ath10k_wmi_pdev_get_tpc_table_cmdid(ar, WMI_TPC_CONFIG_PARAM);
+	if (ret) {
+		ath10k_warn(ar, "failed to request tpc table cmdid: %d\n", ret);
+		return ret;
+	}
+
+	time_left = wait_for_completion_timeout(&ar->debug.tpc_complete,
+						1 * HZ);
+	if (time_left == 0)
+		return -ETIMEDOUT;
+
+	return 0;
+}
+
+static int ath10k_tpc_stats_final_open(struct inode *inode, struct file *file)
+{
+	struct ath10k *ar = inode->i_private;
+	void *buf = NULL;
+	int ret;
+
+	mutex_lock(&ar->conf_mutex);
+
+	if (ar->state != ATH10K_STATE_ON) {
+		ret = -ENETDOWN;
+		goto err_unlock;
+	}
+
+	buf = vmalloc(ATH10K_TPC_CONFIG_BUF_SIZE);
+	if (!buf) {
+		ret = -ENOMEM;
+		goto err_unlock;
+	}
+
+	ret = ath10k_debug_tpc_stats_final_request(ar);
+	if (ret) {
+		ath10k_warn(ar, "failed to request tpc stats final: %d\n",
+			    ret);
+		goto err_free;
+	}
+
+	ath10k_tpc_stats_fill(ar, ar->debug.tpc_stats, buf);
+	file->private_data = buf;
+
+	mutex_unlock(&ar->conf_mutex);
+	return 0;
+
+err_free:
+	vfree(buf);
+
+err_unlock:
+	mutex_unlock(&ar->conf_mutex);
+	return ret;
+}
+
+static int ath10k_tpc_stats_final_release(struct inode *inode,
+					  struct file *file)
+{
+	vfree(file->private_data);
+
+	return 0;
+}
+
+static ssize_t ath10k_tpc_stats_final_read(struct file *file,
+					   char __user *user_buf,
+					   size_t count, loff_t *ppos)
+{
+	const char *buf = file->private_data;
+	unsigned int len = strlen(buf);
+
+	return simple_read_from_buffer(user_buf, count, ppos, buf, len);
+}
+
+static const struct file_operations fops_tpc_stats_final = {
+	.open = ath10k_tpc_stats_final_open,
+	.release = ath10k_tpc_stats_final_release,
+	.read = ath10k_tpc_stats_final_read,
+	.owner = THIS_MODULE,
+	.llseek = default_llseek,
+};
+
+static ssize_t ath10k_write_burst_dur(struct file *file,
+				      const char __user *user_buf,
+				      size_t count, loff_t *ppos)
+{
+	struct ath10k *ar = file->private_data;
+	u32 dur[4];
+	int ret;
+	int ac;
+	char buf[128];
+
+	simple_write_to_buffer(buf, sizeof(buf) - 1, ppos, user_buf, count);
+
+	/* make sure that buf is null terminated */
+	buf[sizeof(buf) - 1] = 0;
+
+	ret = sscanf(buf, "%u %u %u %u", &dur[0], &dur[1], &dur[2], &dur[3]);
+
+	if (!ret)
+		return -EINVAL;
+
+	mutex_lock(&ar->conf_mutex);
+	for (ac = 0; ac < 4; ac++) {
+		if ((dur[ac] != BURST_ZERO) && (dur[ac] < MIN_BURST_DUR || dur[ac] > MAX_BURST_DUR)) {
+			mutex_unlock(&ar->conf_mutex);
+			return -EINVAL;
+		}
+		ar->burst_dur[ac] = dur[ac];
+
+		if (ar->state != ATH10K_STATE_ON)
+			continue;
+
+		ret = ath10k_wmi_pdev_set_param(ar, ar->wmi.pdev_param->aggr_burst,
+						(SM(ac, ATH10K_AGGR_BURST_AC) |
+						SM(dur[ac], ATH10K_AGGR_BURST_DUR)));
+		if (ret) {
+			ath10k_warn(ar, "failed to set aggr burst duration for ac %d: %d\n", ac, ret);
+			goto exit;
+		}
+	}
+
+	ret = count;
+
+exit:
+        mutex_unlock(&ar->conf_mutex);
+        return ret;
+}
+
+static ssize_t ath10k_read_burst_dur(struct file *file,
+				     char __user *user_buf,
+				     size_t count, loff_t *ppos)
+{
+	struct ath10k *ar = file->private_data;
+	int len = 0;
+	char buf[128];
+
+	len = scnprintf(buf, sizeof(buf) - len, "%u %u %u %u\n",
+			ar->burst_dur[0], ar->burst_dur[1],
+			ar->burst_dur[2], ar->burst_dur[3]);
+
+	return simple_read_from_buffer(user_buf, count, ppos, buf, len);
+}
+
+static const struct file_operations fops_burst_dur = {
+        .read = ath10k_read_burst_dur,
+        .write = ath10k_write_burst_dur,
+        .open = simple_open,
+        .owner = THIS_MODULE,
+        .llseek = default_llseek,
+};
+
 int ath10k_debug_create(struct ath10k *ar)
 {
 	size_t tx_delay_stats_size;
@@ -2879,15 +3159,17 @@ int ath10k_debug_create(struct ath10k *ar)
 	INIT_LIST_HEAD(&ar->debug.fw_stats.peers_extd);
 
 	tx_delay_stats_size = sizeof(struct ath10k_tx_delay_stats) *
-				     IEEE80211_NUM_ACS;
+				     ARRAY_SIZE(ar->debug.tx_delay_stats);
 	pbuf = kzalloc(tx_delay_stats_size, GFP_KERNEL);
 	if (!pbuf)
 		return -ENOMEM;
-
-	for (i = 0; i < IEEE80211_NUM_ACS; i++) {
+	for (i = 0; i < ARRAY_SIZE(ar->debug.tx_delay_stats); i++) {
 		ar->debug.tx_delay_stats[i] = pbuf;
 		pbuf++;
 	}
+
+	memset(ar->debug.ftmr_enabled, -1, sizeof(ar->debug.ftmr_enabled));
+
 	return 0;
 }
 
@@ -2902,6 +3184,46 @@ void ath10k_debug_destroy(struct ath10k *ar)
 	kfree(ar->debug.tx_delay_stats[0]);
 }
 
+/* TX delay stats class names ordered by TID. */
+static const char ath10k_tx_delay_stats_names[][7] = {
+	"AC_BE",
+	"AC_BK",
+	"AC_BK+",
+	"AC_BE+",
+	"AC_VI",
+	"AC_VI+",
+	"AC_VO",
+	"AC_VO+",
+	"TID8",
+	"TID9",
+	"TID10",
+	"TID11",
+	"TID12",
+	"TID13",
+	"TID14",
+	"TID15",
+};
+
+#define ATH10K_TX_DELAY_STATS_NAMES_SIZE ARRAY_SIZE(ath10k_tx_delay_stats_names)
+
+/* Returns start time of the transmit delay histogram stats bin. */
+static inline int ath10k_tx_delay_bin_to_ms(int bin)
+{
+	int bin_ms;
+
+	/* The first two bins span 1ms (i.e. [0, 1), and [1, 2)) are returned
+	 * directly. All other power-of-two bucket ranges are subdivided into
+	 * two bins, with the even numbered bin covering the first half of the
+	 * range and the odd numbered bin offset by 1/2 of the range.
+	 */
+	if (bin < 2)
+		return bin;
+	bin_ms = 1 << (bin / 2);
+	if (bin % 2)
+		bin_ms += bin_ms >> 1;
+	return bin_ms;
+}
+
 static ssize_t ath10k_tx_delay_stats_dump(struct file *file,
 					  char __user *user_buf,
 					  size_t count, loff_t *ppos)
@@ -2911,42 +3233,43 @@ static ssize_t ath10k_tx_delay_stats_dump(struct file *file,
 	unsigned int len = 0, buf_len = 4096;
 	ssize_t ret_cnt;
 	struct ath10k_tx_delay_stats *stats;
-	u32 ac, bin, total, counter, target, index;
+	u32 tid, bin, total, counter, target, index;
 	u32 percentile[] = {5, 10, 25, 50, 75, 90, 95, 99};
-
-	char *ac_names[IEEE80211_NUM_ACS] = {"VO", "VI", "BE", "BK"};
 
 	buf = kzalloc(buf_len, GFP_KERNEL);
 	if (!buf)
 		return -ENOMEM;
 
 	len += scnprintf(buf + len, buf_len - len,
-			 "Frames pending in driver: %d\n",
-			 ar->htt.num_pending_tx);
+			 "Frames pending in driver: %d, max: %d,\n",
+			 ar->htt.num_pending_tx, ar->atf_max_num_pending_tx);
 
-	for (ac = 0; ac < IEEE80211_NUM_ACS; ac++) {
-		stats =  ar->debug.tx_delay_stats[ac];
+	BUILD_BUG_ON(ATH10K_TX_DELAY_STATS_NAMES_SIZE != IEEE80211_NUM_TIDS);
+	for (tid = 0; tid < IEEE80211_NUM_TIDS; tid++) {
+		stats = ar->debug.tx_delay_stats[tid];
 		total = 0;
-		for (bin = 0; bin <= ATH10K_DELAY_STATS_MAX_BIN; bin++)
+		for (bin = 0; bin <= ATH10K_TX_DELAY_STATS_MAX_BIN; bin++)
 			total += stats->counts[bin];
 
-		/* Skip AC that has no activity to make output more concise. */
+		/* Skip class that has no activity to make output more
+		 * concise.
+		 */
 		if (total == 0)
 			continue;
 		len += scnprintf(buf + len, buf_len - len,
-				 "TX latency stats for AC[%s]: %d frames\n",
-				 ac_names[ac], total);
+				 "TX latency stats for %s: %d frames\n",
+				 ath10k_tx_delay_stats_names[tid], total);
 		for (counter = 0, bin = 0, index = 0;
 		     index < ARRAY_SIZE(percentile); index++) {
 			target = total * percentile[index] / 100;
 			while ((counter <  target) &&
-			       (bin < ATH10K_DELAY_STATS_MAX_BIN)) {
+			       (bin <= ATH10K_TX_DELAY_STATS_MAX_BIN)) {
 				counter += stats->counts[bin];
 				bin++;
 			}
 			len += scnprintf(buf + len, buf_len - len,
 					 "P%d:\t<%dms\n", percentile[index],
-					 10 * bin);
+					 ath10k_tx_delay_bin_to_ms(bin));
 		}
 	}
 
@@ -2969,7 +3292,9 @@ static ssize_t ath10k_tx_delay_stats_clear(struct file *file,
 		return -EINVAL;
 
 	memset(ar->debug.tx_delay_stats[0], 0,
-	       sizeof(struct ath10k_tx_delay_stats) * IEEE80211_NUM_ACS);
+	       sizeof(struct ath10k_tx_delay_stats) *
+		   ARRAY_SIZE(ar->debug.tx_delay_stats));
+	ar->atf_max_num_pending_tx = 0;
 	return count;
 }
 
@@ -2997,15 +3322,16 @@ static ssize_t ath10k_tx_delay_histo_dump(struct file *file,
 		return -ENOMEM;
 
 	len += scnprintf(buf + len, buf_len - len, "TX delay histogram(ms)\n");
-	for (i = 0; i < ATH10K_DELAY_STATS_MAX_BIN; i++) {
-		len += scnprintf(buf + len, buf_len - len, "[%4u - %4u]:%8u ",
-				10 * i, 10 * (i + 1), stats_local.counts[i]);
-
+	for (i = 0; i < ATH10K_TX_DELAY_STATS_MAX_BIN; i++) {
+		len += scnprintf(buf + len, buf_len - len, "[%4u - %4u):%8u ",
+				 ath10k_tx_delay_bin_to_ms(i),
+				 ath10k_tx_delay_bin_to_ms(i + 1),
+				 stats_local.counts[i]);
 		if (i % 5 == 4)
 			len += scnprintf(buf + len, buf_len - len, "\n");
 	}
-	len += scnprintf(buf + len, buf_len - len, "[> 1000]:%8u ",
-				stats_local.counts[i]);
+	len += scnprintf(buf + len, buf_len - len, "[%4d -  inf):%8u ",
+			 ath10k_tx_delay_bin_to_ms(i), stats_local.counts[i]);
 	len += scnprintf(buf + len, buf_len - len, "\n");
 
 	ret_cnt = simple_read_from_buffer(user_buf, count, ppos, buf, len);
@@ -3041,7 +3367,6 @@ void ath10k_txdelay_debugfs_register(struct ath10k *ar)
 {
 	struct dentry *tx_delay_histo_dir;
 	int i;
-	char *ac[IEEE80211_NUM_ACS] = {"AC_VO", "AC_VI", "AC_BE", "AC_BK"};
 
 	tx_delay_histo_dir = debugfs_create_dir("tx_delay_histogram",
 						ar->debug.debugfs_phy);
@@ -3050,9 +3375,9 @@ void ath10k_txdelay_debugfs_register(struct ath10k *ar)
 			"tx_delay_stats");
 		return;
 	}
-	for (i = 0; i < IEEE80211_NUM_ACS; i++) {
-		debugfs_create_file(ac[i], S_IRUGO | S_IWUSR,
-				    tx_delay_histo_dir,
+	for (i = 0; i < ATH10K_TX_DELAY_STATS_NAMES_SIZE; i++) {
+		debugfs_create_file(ath10k_tx_delay_stats_names[i],
+				    S_IRUGO | S_IWUSR, tx_delay_histo_dir,
 				    ar->debug.tx_delay_stats[i],
 				    &fops_tx_delay_histo);
 	}
@@ -3063,6 +3388,166 @@ void ath10k_txdelay_debugfs_register(struct ath10k *ar)
 
 	return;
 }
+
+static ssize_t ath10k_write_ftm_resp(struct file *file,
+				     const char __user *user_buf,
+				     size_t count, loff_t *ppos)
+{
+	struct ath10k *ar = file->private_data;
+	struct ath10k_vif *arvif;
+	unsigned int vdev_id, enable;
+	int ret;
+	char buf[64] = {0};
+
+	simple_write_to_buffer(buf, sizeof(buf) - 1, ppos, user_buf, count);
+
+	buf[sizeof(buf) - 1] = '\0';
+
+	ret = sscanf(buf, "%u %u", &vdev_id, &enable);
+	if (ret != 2)
+		return -EINVAL;
+
+	mutex_lock(&ar->conf_mutex);
+
+	if (ar->state != ATH10K_STATE_ON &&
+	    ar->state != ATH10K_STATE_RESTARTED) {
+		ret = -ENETDOWN;
+		goto exit;
+	}
+
+	arvif = ath10k_get_arvif(ar, vdev_id);
+	if (!arvif) {
+		ret = -EINVAL;
+		goto exit;
+	}
+
+	/* Disabling the FTMR while there are active sessions is not allowed
+	 * as this makes FW wait for all active sessions to run to completion
+	 */
+	if (!enable && arvif->is_up) {
+		ret = -EPERM;
+		ath10k_warn(ar,
+			    "FTMR disable not allowed as vdev: %d is up: %d\n",
+			    vdev_id, ret);
+		goto exit;
+	}
+
+	if (enable == ar->debug.ftmr_enabled[vdev_id]) {
+		ret = count;
+		goto exit;
+	}
+
+	ret = ath10k_wmi_vdev_set_param(ar, arvif->vdev_id,
+					ar->wmi.vdev_param->rtt_responder_role,
+					enable);
+
+	if (ret && ret != -EOPNOTSUPP) {
+		ath10k_warn(ar, "failed to set ftm_resp for vdev: %d: %d\n",
+			    vdev_id, ret);
+		goto exit;
+	}
+
+	ar->debug.ftmr_enabled[vdev_id] = enable;
+	ret = count;
+exit:
+	mutex_unlock(&ar->conf_mutex);
+	return ret;
+}
+
+static ssize_t ath10k_read_ftm_resp(struct file *file, char __user *user_buf,
+				    size_t count, loff_t *ppos)
+{
+	struct ath10k *ar = file->private_data;
+	struct ath10k_vif *arvif;
+	ssize_t ret_cnt;
+	int len = 0, buf_len = 4096;
+	char *buf;
+
+	buf = kzalloc(buf_len, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	len += scnprintf(buf + len, buf_len - len, "%17s vdev_id status\n",
+			 "mac");
+
+	mutex_lock(&ar->conf_mutex);
+	list_for_each_entry(arvif, &ar->arvifs, list)
+		len += scnprintf(buf + len, buf_len - len, "%pM %7u %6u\n",
+				 arvif->vif->addr, arvif->vdev_id,
+				 ar->debug.ftmr_enabled[arvif->vdev_id]);
+
+	mutex_unlock(&ar->conf_mutex);
+
+	ret_cnt = simple_read_from_buffer(user_buf, count, ppos, buf, len);
+	kfree(buf);
+
+	return ret_cnt;
+}
+
+static const struct file_operations fops_ftm_resp = {
+	.read = ath10k_read_ftm_resp,
+	.write = ath10k_write_ftm_resp,
+	.open = simple_open,
+	.owner = THIS_MODULE,
+	.llseek = default_llseek,
+};
+
+static ssize_t ath10k_write_rts_threshold(struct file *file,
+					  const char __user *user_buf,
+					  size_t count, loff_t *ppos)
+{
+	struct ath10k *ar = file->private_data;
+	int rts_threshold, ret = 0;
+	struct ath10k_vif *arvif;
+	struct ieee80211_vif *vif;
+
+	ret = kstrtoint_from_user(user_buf, count, 0, &rts_threshold);
+	if (ret)
+		return ret;
+
+	mutex_lock(&ar->conf_mutex);
+	list_for_each_entry(arvif, &ar->arvifs, list) {
+		vif = arvif->vif;
+		if (vif->type != NL80211_IFTYPE_MESH_POINT) {
+			ar->hw->wiphy->rts_threshold = rts_threshold;
+			ret = ath10k_wmi_vdev_set_param(ar, arvif->vdev_id,
+							ar->wmi.vdev_param->rts_threshold,
+							ar->hw->wiphy->rts_threshold);
+			if (ret) {
+				ath10k_warn(ar,
+					    "Failed to set rts threshold for vdev %d: %d\n",
+					    arvif->vdev_id, ret);
+				break;
+			}
+		}
+	}
+
+	mutex_unlock(&ar->conf_mutex);
+	return count;
+}
+
+static ssize_t ath10k_read_rts_threshold(struct file *file,
+					 char __user *user_buf,
+					 size_t count, loff_t *ppos)
+{
+	struct ath10k *ar = file->private_data;
+	char buf[32];
+	int len = 0;
+
+	mutex_lock(&ar->conf_mutex);
+	len = scnprintf(buf, sizeof(buf) - len, "%d\n",
+			ar->hw->wiphy->rts_threshold);
+	mutex_unlock(&ar->conf_mutex);
+	return simple_read_from_buffer(user_buf, count, ppos, buf, len);
+}
+
+static const struct file_operations fops_rts_threshold = {
+	.read = ath10k_read_rts_threshold,
+	.write = ath10k_write_rts_threshold,
+	.open = simple_open,
+	.owner = THIS_MODULE,
+	.llseek = default_llseek,
+};
 
 int ath10k_debug_register(struct ath10k *ar)
 {
@@ -3113,6 +3598,8 @@ int ath10k_debug_register(struct ath10k *ar)
 
 	debugfs_create_file("warm_hw_reset", S_IRUSR | S_IWUSR,
 			    ar->debug.debugfs_phy, ar, &fops_warm_hw_reset);
+	debugfs_create_file("burst_dur", S_IRUSR | S_IWUSR,
+                            ar->debug.debugfs_phy, ar, &fops_burst_dur);
 
 	debugfs_create_file("reset_htt_stats", S_IRUSR | S_IWUSR,
 			    ar->debug.debugfs_phy, ar, &fops_reset_htt_stats);
@@ -3183,20 +3670,30 @@ int ath10k_debug_register(struct ath10k *ar)
 	debugfs_create_file("atf_enable", 0600,
 			    ar->debug.debugfs_phy, ar, &fops_atf_enable);
 
-	debugfs_create_file("atf_airtime_threshold", 0600,
-			    ar->debug.debugfs_phy, ar, &fops_atf_threshold);
-
-	debugfs_create_file("atf_release_limit", 0600,
-			    ar->debug.debugfs_phy, ar, &fops_atf_release_limit);
+	debugfs_create_file("atf_param", 0600,
+			    ar->debug.debugfs_phy, ar, &fops_atf_param);
 
 	debugfs_create_file("atf_stats", 0600, ar->debug.debugfs_phy, ar,
 			    &fops_atf_stats);
+
+	debugfs_create_file("tpc_stats_final", S_IRUSR,
+			    ar->debug.debugfs_phy, ar, &fops_tpc_stats_final);
 
 #ifdef CONFIG_ATH10K_SMART_ANTENNA
 	ath10k_smart_ant_debugfs_init(ar);
 #endif
 	ath10k_txdelay_debugfs_register(ar);
 
+	if (test_bit(WMI_SERVICE_CFR_CAPTURE_SUPPORT, ar->wmi.svc_map))
+		debugfs_create_file("periodic_cfr_enable", 0600,
+				    ar->debug.debugfs_phy,
+				    ar, &fops_cfr_enable);
+
+	debugfs_create_file("ftm_resp", 0600,
+			    ar->debug.debugfs_phy, ar, &fops_ftm_resp);
+
+	debugfs_create_file("rts_threshold", 0600,
+			    ar->debug.debugfs_phy, ar, &fops_rts_threshold);
 	return 0;
 }
 

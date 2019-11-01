@@ -2868,6 +2868,10 @@ skl_ddb_get_pipe_allocation_limits(struct drm_device *dev,
 	else
 		*num_active = hweight32(dev_priv->active_crtcs);
 
+	if (*num_active == 0)
+		return;
+
+
 	if (IS_BROXTON(dev))
 		ddb_size = BXT_DDB_SIZE;
 	else
@@ -3066,6 +3070,9 @@ skl_allocate_pipe_ddb(struct intel_crtc_state *cstate,
 	}
 
 	skl_ddb_get_pipe_allocation_limits(dev, cstate, alloc, &num_active);
+	if (!num_active)
+		return -ENODEV;
+
 	alloc_size = skl_ddb_entry_size(alloc);
 	if (alloc_size == 0) {
 		memset(ddb->plane[pipe], 0, sizeof(ddb->plane[pipe]));
@@ -4621,7 +4628,7 @@ static void gen6_set_rps(struct drm_device *dev, u8 val)
 	POSTING_READ(GEN6_RPNSWREQ);
 
 	dev_priv->rps.cur_freq = val;
-	trace_intel_gpu_freq_change(val * 50);
+	trace_intel_gpu_freq_change(intel_gpu_freq(dev_priv, val));
 }
 
 static void valleyview_set_rps(struct drm_device *dev, u8 val)
@@ -7397,6 +7404,82 @@ static int vlv_gpu_freq_div(unsigned int czclk_freq)
 	}
 }
 
+static bool skl_pcode_try_request(struct drm_i915_private *dev_priv, u32 mbox,
+				  u32 request, u32 reply_mask, u32 reply,
+				  u32 *status)
+{
+	u32 val = request;
+
+	*status = sandybridge_pcode_read(dev_priv, mbox, &val);
+
+	return *status || ((val & reply_mask) == reply);
+}
+
+/**
+ * skl_pcode_request - send PCODE request until acknowledgment
+ * @dev_priv: device private
+ * @mbox: PCODE mailbox ID the request is targeted for
+ * @request: request ID
+ * @reply_mask: mask used to check for request acknowledgment
+ * @reply: value used to check for request acknowledgment
+ * @timeout_base_ms: timeout for polling with preemption enabled
+ *
+ * Keep resending the @request to @mbox until PCODE acknowledges it, PCODE
+ * reports an error or an overall timeout of @timeout_base_ms+50 ms expires.
+ * The request is acknowledged once the PCODE reply dword equals @reply after
+ * applying @reply_mask. Polling is first attempted with preemption enabled
+ * for @timeout_base_ms and if this times out for another 50 ms with
+ * preemption disabled.
+ *
+ * Returns 0 on success, %-ETIMEDOUT in case of a timeout, <0 in case of some
+ * other error as reported by PCODE.
+ */
+int skl_pcode_request(struct drm_i915_private *dev_priv, u32 mbox, u32 request,
+		      u32 reply_mask, u32 reply, int timeout_base_ms)
+{
+	u32 status;
+	int ret;
+
+	WARN_ON(!mutex_is_locked(&dev_priv->rps.hw_lock));
+
+#define COND skl_pcode_try_request(dev_priv, mbox, request, reply_mask, reply, \
+				   &status)
+
+	/*
+	 * Prime the PCODE by doing a request first. Normally it guarantees
+	 * that a subsequent request, at most @timeout_base_ms later, succeeds.
+	 * _wait_for() doesn't guarantee when its passed condition is evaluated
+	 * first, so send the first request explicitly.
+	 */
+	if (COND) {
+		ret = 0;
+		goto out;
+	}
+	ret = _wait_for(COND, timeout_base_ms * 1000, 10);
+	if (!ret)
+		goto out;
+
+	/*
+	 * The above can time out if the number of requests was low (2 in the
+	 * worst case) _and_ PCODE was busy for some reason even after a
+	 * (queued) request and @timeout_base_ms delay. As a workaround retry
+	 * the poll with preemption disabled to maximize the number of
+	 * requests. Increase the timeout from @timeout_base_ms to 50ms to
+	 * account for interrupts that could reduce the number of these
+	 * requests, and for any quirks of the PCODE firmware that delays
+	 * the request completion.
+	 */
+	DRM_DEBUG_KMS("PCODE timeout, retrying with preemption disabled\n");
+	WARN_ON_ONCE(timeout_base_ms > 3);
+	preempt_disable();
+	ret = wait_for_atomic(COND, 50);
+	preempt_enable();
+
+out:
+	return ret ? ret : status;
+#undef COND
+}
+
 static int byt_gpu_freq(struct drm_i915_private *dev_priv, int val)
 {
 	int div, czclk_freq = DIV_ROUND_CLOSEST(dev_priv->czclk_freq, 1000);
@@ -7445,7 +7528,8 @@ static int chv_freq_opcode(struct drm_i915_private *dev_priv, int val)
 int intel_gpu_freq(struct drm_i915_private *dev_priv, int val)
 {
 	if (IS_GEN9(dev_priv->dev))
-		return (val * GT_FREQUENCY_MULTIPLIER) / GEN9_FREQ_SCALER;
+		return DIV_ROUND_CLOSEST(val * GT_FREQUENCY_MULTIPLIER,
+					 GEN9_FREQ_SCALER);
 	else if (IS_CHERRYVIEW(dev_priv->dev))
 		return chv_gpu_freq(dev_priv, val);
 	else if (IS_VALLEYVIEW(dev_priv->dev))
@@ -7457,13 +7541,14 @@ int intel_gpu_freq(struct drm_i915_private *dev_priv, int val)
 int intel_freq_opcode(struct drm_i915_private *dev_priv, int val)
 {
 	if (IS_GEN9(dev_priv->dev))
-		return (val * GEN9_FREQ_SCALER) / GT_FREQUENCY_MULTIPLIER;
+		return DIV_ROUND_CLOSEST(val * GEN9_FREQ_SCALER,
+					 GT_FREQUENCY_MULTIPLIER);
 	else if (IS_CHERRYVIEW(dev_priv->dev))
 		return chv_freq_opcode(dev_priv, val);
 	else if (IS_VALLEYVIEW(dev_priv->dev))
 		return byt_freq_opcode(dev_priv, val);
 	else
-		return val / GT_FREQUENCY_MULTIPLIER;
+		return DIV_ROUND_CLOSEST(val, GT_FREQUENCY_MULTIPLIER);
 }
 
 struct request_boost {

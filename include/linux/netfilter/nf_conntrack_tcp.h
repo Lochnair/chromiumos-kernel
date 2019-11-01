@@ -13,6 +13,14 @@ struct ip_ct_tcp_state {
 	u_int8_t	flags;		/* per direction options */
 };
 
+struct tcp_latency_sample {
+	u_int64_t	send_ts;
+	atomic_t	sampling_state;
+	u_int32_t	last_seq;
+	u_int32_t	last_hrtt;
+	u_int32_t	s_hrtt_us;	/* smoothed hrtt in us */
+};
+
 struct ip_ct_tcp {
 	struct ip_ct_tcp_state seen[2];	/* connection parameters per direction */
 	u_int8_t	state;		/* state of the connection (enum tcp_conntrack) */
@@ -27,6 +35,10 @@ struct ip_ct_tcp {
 	/* For SYN packets while we may be out-of-sync */
 	u_int8_t	last_wscale;	/* Last window scaling factor seen */
 	u_int8_t	last_flags;	/* Last flags set */
+#if IS_ENABLED(CONFIG_NET_SCH_ARL)
+	/* Track TCP stream's latency */
+	struct tcp_latency_sample latency_sample;
+#endif
 };
 
 #endif /* _NF_CONNTRACK_TCP_H */

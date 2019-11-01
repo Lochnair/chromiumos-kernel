@@ -1027,7 +1027,7 @@ static struct clk_rcg2 wcss2g_clk_src = {
 		.parent_names = gcc_xo_wcss2g,
 		.num_parents = 2,
 		.ops = &clk_rcg2_ops,
-		.flags = CLK_SET_RATE_PARENT,
+		.flags = CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED,
 	},
 };
 
@@ -1043,7 +1043,7 @@ static struct clk_branch gcc_wcss2g_clk = {
 			},
 			.num_parents = 1,
 			.ops = &clk_branch2_ops,
-			.flags = CLK_SET_RATE_PARENT,
+			.flags = CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED,
 		},
 	},
 };
@@ -1060,7 +1060,7 @@ static struct clk_branch gcc_wcss2g_ref_clk = {
 			},
 			.num_parents = 1,
 			.ops = &clk_branch2_ops,
-			.flags = CLK_SET_RATE_PARENT,
+			.flags = CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED,
 		},
 	},
 };
@@ -1077,6 +1077,7 @@ static struct clk_branch gcc_wcss2g_rtc_clk = {
 			},
 			.num_parents = 1,
 			.ops = &clk_branch2_ops,
+			.flags = CLK_IGNORE_UNUSED,
 		},
 	},
 };
@@ -1097,6 +1098,7 @@ static struct clk_rcg2 wcss5g_clk_src = {
 		.parent_names = gcc_xo_wcss5g,
 		.num_parents = 2,
 		.ops = &clk_rcg2_ops,
+		.flags = CLK_IGNORE_UNUSED,
 	},
 };
 
@@ -1112,7 +1114,7 @@ static struct clk_branch gcc_wcss5g_clk = {
 			},
 			.num_parents = 1,
 			.ops = &clk_branch2_ops,
-			.flags = CLK_SET_RATE_PARENT,
+			.flags = CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED,
 		},
 	},
 };
@@ -1129,7 +1131,7 @@ static struct clk_branch gcc_wcss5g_ref_clk = {
 			},
 			.num_parents = 1,
 			.ops = &clk_branch2_ops,
-			.flags = CLK_SET_RATE_PARENT,
+			.flags = CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED,
 		},
 	},
 };
@@ -1146,7 +1148,7 @@ static struct clk_branch gcc_wcss5g_rtc_clk = {
 			},
 			.num_parents = 1,
 			.ops = &clk_branch2_ops,
-			.flags = CLK_SET_RATE_PARENT,
+			.flags = CLK_SET_RATE_PARENT | CLK_IGNORE_UNUSED,
 		},
 	},
 };

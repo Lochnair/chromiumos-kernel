@@ -107,7 +107,7 @@ static int cros_ec_sensors_read(struct iio_dev *indio_dev,
 			 * Do not use IIO_DEGREE_TO_RAD to avoid precision
 			 * loss. Round to the nearest integer.
 			 */
-			*val = div_s64(val64 * 314159 + 9000000ULL, 1000);
+			*val = div_s64(val64 * 314159 + 500ULL, 1000);
 			*val2 = 18000 << (CROS_EC_SENSOR_BITS - 1);
 			ret = IIO_VAL_FRACTIONAL;
 			break;
@@ -254,6 +254,14 @@ static int cros_ec_sensors_probe(struct platform_device *pdev)
 			break;
 		case MOTIONSENSE_TYPE_MAG:
 			channel->type = IIO_MAGN;
+			/*
+			 * Workaround for b:68394559:
+			 * The BMM150 frequency reported by the EC can be too
+			 * high. Scale it down to default when greater than
+			 * 50Hz.
+			 */
+			if (state->core.max_freq > 50000)
+				state->core.max_freq = 25000;
 			break;
 		default:
 			dev_warn(&pdev->dev, "unknown\n");

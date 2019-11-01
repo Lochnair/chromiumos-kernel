@@ -999,6 +999,7 @@ const struct proc_ns_operations userns_operations = {
 	.put		= userns_put,
 	.install	= userns_install,
 };
+EXPORT_SYMBOL(userns_operations);
 
 static __init int user_namespaces_init(void)
 {

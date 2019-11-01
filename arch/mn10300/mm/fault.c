@@ -60,7 +60,7 @@ void bust_spinlocks(int yes)
 void do_BUG(const char *file, int line)
 {
 	bust_spinlocks(1);
-	printk(KERN_EMERG "------------[ cut here ]------------\n");
+	printk(KERN_EMERG CUT_HERE);
 	printk(KERN_EMERG "kernel BUG at %s:%d!\n", file, line);
 }
 
@@ -262,6 +262,8 @@ good_area:
 	if (unlikely(fault & VM_FAULT_ERROR)) {
 		if (fault & VM_FAULT_OOM)
 			goto out_of_memory;
+		else if (fault & VM_FAULT_SIGSEGV)
+			goto bad_area;
 		else if (fault & VM_FAULT_SIGBUS)
 			goto do_sigbus;
 		BUG();

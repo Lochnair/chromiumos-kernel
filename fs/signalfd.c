@@ -141,6 +141,11 @@ static int signalfd_copyinfo(struct signalfd_siginfo __user *uinfo,
 		err |= __put_user((long) kinfo->si_ptr, &uinfo->ssi_ptr);
 		err |= __put_user(kinfo->si_int, &uinfo->ssi_int);
 		break;
+	case __SI_SYS:
+		err |= __put_user((long) kinfo->si_call_addr, &uinfo->ssi_call_addr);
+		err |= __put_user(kinfo->si_syscall, &uinfo->ssi_syscall);
+		err |= __put_user(kinfo->si_arch, &uinfo->ssi_arch);
+		break;
 	default:
 		/*
 		 * This case catches also the signals queued by sigqueue().

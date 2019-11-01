@@ -624,7 +624,7 @@ TRACE_EVENT(ath10k_atf_upd,
 			__entry->bitrate = txq->sta->last_tx_bitrate;
 			MAC_ASSIGN(mac_addr, txq->sta->addr);
 		} else {
-			__entry->bitrate = 0;
+			__entry->bitrate = 60;
 			MAC_ASSIGN(mac_addr, txq->sta);
 		}
 	),

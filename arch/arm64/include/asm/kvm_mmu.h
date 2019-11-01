@@ -83,6 +83,7 @@ int create_hyp_io_mappings(void *from, void *to, phys_addr_t);
 void free_boot_hyp_pgd(void);
 void free_hyp_pgds(void);
 
+void stage2_unmap_vm(struct kvm *kvm);
 int kvm_alloc_stage2_pgd(struct kvm *kvm);
 void kvm_free_stage2_pgd(struct kvm *kvm);
 int kvm_phys_addr_ioremap(struct kvm *kvm, phys_addr_t guest_ipa,
@@ -117,6 +118,27 @@ static inline void kvm_set_s2pmd_writable(pmd_t *pmd)
 	pmd_val(*pmd) |= PMD_S2_RDWR;
 }
 
+static inline void kvm_set_s2pte_readonly(pte_t *pte)
+{
+	pte_val(*pte) = (pte_val(*pte) & ~PTE_S2_RDWR) | PTE_S2_RDONLY;
+}
+
+static inline bool kvm_s2pte_readonly(pte_t *pte)
+{
+	return (pte_val(*pte) & PTE_S2_RDWR) == PTE_S2_RDONLY;
+}
+
+static inline void kvm_set_s2pmd_readonly(pmd_t *pmd)
+{
+	pmd_val(*pmd) = (pmd_val(*pmd) & ~PMD_S2_RDWR) | PMD_S2_RDONLY;
+}
+
+static inline bool kvm_s2pmd_readonly(pmd_t *pmd)
+{
+	return (pmd_val(*pmd) & PMD_S2_RDWR) == PMD_S2_RDONLY;
+}
+
+
 #define kvm_pgd_addr_end(addr, end)	pgd_addr_end(addr, end)
 #define kvm_pud_addr_end(addr, end)	pud_addr_end(addr, end)
 #define kvm_pmd_addr_end(addr, end)	pmd_addr_end(addr, end)
@@ -136,6 +158,8 @@ static inline void kvm_set_s2pmd_writable(pmd_t *pmd)
 #define PTRS_PER_S2_PGD		(1 << PTRS_PER_S2_PGD_SHIFT)
 #define S2_PGD_ORDER		get_order(PTRS_PER_S2_PGD * sizeof(pgd_t))
 
+#define kvm_pgd_index(addr)	(((addr) >> PGDIR_SHIFT) & (PTRS_PER_S2_PGD - 1))
+
 /*
  * If we are concatenating first level stage-2 page tables, we would have less
  * than or equal to 16 pointers in the fake PGD, because that's what the
@@ -148,43 +172,6 @@ static inline void kvm_set_s2pmd_writable(pmd_t *pmd)
 #else
 #define KVM_PREALLOC_LEVEL	(0)
 #endif
-
-/**
- * kvm_prealloc_hwpgd - allocate inital table for VTTBR
- * @kvm:	The KVM struct pointer for the VM.
- * @pgd:	The kernel pseudo pgd
- *
- * When the kernel uses more levels of page tables than the guest, we allocate
- * a fake PGD and pre-populate it to point to the next-level page table, which
- * will be the real initial page table pointed to by the VTTBR.
- *
- * When KVM_PREALLOC_LEVEL==2, we allocate a single page for the PMD and
- * the kernel will use folded pud.  When KVM_PREALLOC_LEVEL==1, we
- * allocate 2 consecutive PUD pages.
- */
-static inline int kvm_prealloc_hwpgd(struct kvm *kvm, pgd_t *pgd)
-{
-	unsigned int i;
-	unsigned long hwpgd;
-
-	if (KVM_PREALLOC_LEVEL == 0)
-		return 0;
-
-	hwpgd = __get_free_pages(GFP_KERNEL | __GFP_ZERO, PTRS_PER_S2_PGD_SHIFT);
-	if (!hwpgd)
-		return -ENOMEM;
-
-	for (i = 0; i < PTRS_PER_S2_PGD; i++) {
-		if (KVM_PREALLOC_LEVEL == 1)
-			pgd_populate(NULL, pgd + i,
-				     (pud_t *)hwpgd + i * PTRS_PER_PUD);
-		else if (KVM_PREALLOC_LEVEL == 2)
-			pud_populate(NULL, pud_offset(pgd, 0) + i,
-				     (pmd_t *)hwpgd + i * PTRS_PER_PMD);
-	}
-
-	return 0;
-}
 
 static inline void *kvm_get_hwpgd(struct kvm *kvm)
 {
@@ -202,12 +189,11 @@ static inline void *kvm_get_hwpgd(struct kvm *kvm)
 	return pmd_offset(pud, 0);
 }
 
-static inline void kvm_free_hwpgd(struct kvm *kvm)
+static inline unsigned int kvm_get_hwpgd_size(void)
 {
-	if (KVM_PREALLOC_LEVEL > 0) {
-		unsigned long hwpgd = (unsigned long)kvm_get_hwpgd(kvm);
-		free_pages(hwpgd, PTRS_PER_S2_PGD_SHIFT);
-	}
+	if (KVM_PREALLOC_LEVEL > 0)
+		return PTRS_PER_S2_PGD * PAGE_SIZE;
+	return PTRS_PER_S2_PGD * sizeof(pgd_t);
 }
 
 static inline bool kvm_page_empty(void *ptr)
@@ -242,23 +228,112 @@ static inline bool vcpu_has_cache_enabled(struct kvm_vcpu *vcpu)
 	return (vcpu_sys_reg(vcpu, SCTLR_EL1) & 0b101) == 0b101;
 }
 
-static inline void coherent_cache_guest_page(struct kvm_vcpu *vcpu, hva_t hva,
-					     unsigned long size)
+static inline void __coherent_cache_guest_page(struct kvm_vcpu *vcpu, pfn_t pfn,
+					       unsigned long size,
+					       bool ipa_uncached)
 {
-	if (!vcpu_has_cache_enabled(vcpu))
-		kvm_flush_dcache_to_poc((void *)hva, size);
+	void *va = page_address(pfn_to_page(pfn));
+
+	kvm_flush_dcache_to_poc(va, size);
 
 	if (!icache_is_aliasing()) {		/* PIPT */
-		flush_icache_range(hva, hva + size);
+		flush_icache_range((unsigned long)va,
+				   (unsigned long)va + size);
 	} else if (!icache_is_aivivt()) {	/* non ASID-tagged VIVT */
 		/* any kind of VIPT cache */
 		__flush_icache_all();
 	}
 }
 
+static inline void __kvm_flush_dcache_pte(pte_t pte)
+{
+	struct page *page = pte_page(pte);
+	kvm_flush_dcache_to_poc(page_address(page), PAGE_SIZE);
+}
+
+static inline void __kvm_flush_dcache_pmd(pmd_t pmd)
+{
+	struct page *page = pmd_page(pmd);
+	kvm_flush_dcache_to_poc(page_address(page), PMD_SIZE);
+}
+
+static inline void __kvm_flush_dcache_pud(pud_t pud)
+{
+	struct page *page = pud_page(pud);
+	kvm_flush_dcache_to_poc(page_address(page), PUD_SIZE);
+}
+
 #define kvm_virt_to_phys(x)		__virt_to_phys((unsigned long)(x))
 
-void stage2_flush_vm(struct kvm *kvm);
+void kvm_set_way_flush(struct kvm_vcpu *vcpu);
+void kvm_toggle_cache(struct kvm_vcpu *vcpu, bool was_enabled);
+
+static inline bool __kvm_cpu_uses_extended_idmap(void)
+{
+	return false;
+}
+
+static inline void __kvm_extend_hypmap(pgd_t *boot_hyp_pgd,
+				       pgd_t *hyp_pgd,
+				       pgd_t *merged_hyp_pgd,
+				       unsigned long hyp_idmap_start)
+{
+	int idmap_idx;
+
+	/*
+	 * Use the first entry to access the HYP mappings. It is
+	 * guaranteed to be free, otherwise we wouldn't use an
+	 * extended idmap.
+	 */
+	VM_BUG_ON(pgd_val(merged_hyp_pgd[0]));
+	merged_hyp_pgd[0] = __pgd(__pa(hyp_pgd) | PMD_TYPE_TABLE);
+
+	/*
+	 * Create another extended level entry that points to the boot HYP map,
+	 * which contains an ID mapping of the HYP init code. We essentially
+	 * merge the boot and runtime HYP maps by doing so, but they don't
+	 * overlap anyway, so this is fine.
+	 */
+	idmap_idx = hyp_idmap_start >> VA_BITS;
+	VM_BUG_ON(pgd_val(merged_hyp_pgd[idmap_idx]));
+	merged_hyp_pgd[idmap_idx] = __pgd(__pa(boot_hyp_pgd) | PMD_TYPE_TABLE);
+}
+
+#ifdef CONFIG_HARDEN_BRANCH_PREDICTOR
+#include <asm/mmu.h>
+
+static inline void *kvm_get_hyp_vector(void)
+{
+	struct bp_hardening_data *data = arm64_get_bp_hardening_data();
+	void *vect = __kvm_hyp_vector;
+
+	if (data->fn) {
+		vect = __bp_harden_hyp_vecs_start +
+		       data->hyp_vectors_slot * SZ_2K;
+
+		vect = lm_alias(vect);
+	}
+
+	return vect;
+}
+
+static inline int kvm_map_vectors(void)
+{
+	return create_hyp_mappings(__bp_harden_hyp_vecs_start,
+				   __bp_harden_hyp_vecs_end);
+}
+
+#else
+static inline void *kvm_get_hyp_vector(void)
+{
+	return __kvm_hyp_vector;
+}
+
+static inline int kvm_map_vectors(void)
+{
+	return 0;
+}
+#endif
 
 #endif /* __ASSEMBLY__ */
 #endif /* __ARM64_KVM_MMU_H__ */

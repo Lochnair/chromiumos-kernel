@@ -58,6 +58,8 @@
 #include <asm/context_tracking.h>
 #include <asm/smap.h>
 #include <asm/pgtable_types.h>
+#include <asm/kaiser.h>
+#include <asm/nospec-branch.h>
 #include <linux/err.h>
 
 /* Avoid __ASSEMBLER__'ifying <linux/audit.h> just for this.  */
@@ -262,6 +264,7 @@ ENDPROC(native_usergs_sysret64)
 	testl $3, CS-RBP(%rsi)
 	je 1f
 	SWAPGS
+	SWITCH_KERNEL_CR3
 	/*
 	 * irq_count is used to check if a CPU is already on an interrupt stack
 	 * or not. While this is essentially redundant with preempt_count it is
@@ -283,6 +286,12 @@ ENDPROC(native_usergs_sysret64)
 	TRACE_IRQS_OFF
 	.endm
 
+/*
+ * Return: ebx=0: needs swapgs but not SWITCH_USER_CR3 in paranoid_exit
+ *         ebx=1: needs neither swapgs nor SWITCH_USER_CR3 in paranoid_exit
+ *         ebx=2: needs both swapgs and SWITCH_USER_CR3 in paranoid_exit
+ *         ebx=3: needs SWITCH_USER_CR3 but not swapgs in paranoid_exit
+ */
 ENTRY(save_paranoid)
 	XCPT_FRAME 1 RDI+8
 	cld
@@ -308,7 +317,26 @@ ENTRY(save_paranoid)
 	js 1f	/* negative -> in kernel */
 	SWAPGS
 	xorl %ebx,%ebx
-1:	ret
+1:
+#ifdef CONFIG_PAGE_TABLE_ISOLATION
+	/*
+	 * We might have come in between a swapgs and a SWITCH_KERNEL_CR3
+	 * on entry, or between a SWITCH_USER_CR3 and a swapgs on exit.
+	 * Do a conditional SWITCH_KERNEL_CR3: this could safely be done
+	 * unconditionally, but we need to find out whether the reverse
+	 * should be done on return (conveyed to paranoid_exit in %ebx).
+	 */
+	ALTERNATIVE "jmp 2f", "movq %cr3, %rax", X86_FEATURE_KAISER
+	testl	$KAISER_SHADOW_PGD_OFFSET, %eax
+	jz	2f
+	orl	$2, %ebx
+	andq	$(~(X86_CR3_PCID_ASID_MASK | KAISER_SHADOW_PGD_OFFSET)), %rax
+	/* If PCID enabled, set X86_CR3_PCID_NOFLUSH_BIT */
+	ALTERNATIVE "", "bts $63, %rax", X86_FEATURE_PCID
+	movq	%rax, %cr3
+2:
+#endif
+	ret
 	CFI_ENDPROC
 END(save_paranoid)
 
@@ -334,17 +362,20 @@ ENTRY(ret_from_fork)
 	testl $3, CS-ARGOFFSET(%rsp)		# from kernel_thread?
 	jz   1f
 
-	testl $_TIF_IA32, TI_flags(%rcx)	# 32-bit compat task needs IRET
-	jnz  int_ret_from_sys_call
-
-	RESTORE_TOP_OF_STACK %rdi, -ARGOFFSET
-	jmp ret_from_sys_call			# go to the SYSRET fastpath
+	/*
+	 * By the time we get here, we have no idea whether our pt_regs,
+	 * ti flags, and ti status came from the 64-bit SYSCALL fast path,
+	 * the slow path, or one of the ia32entry paths.
+	 * Use int_ret_from_sys_call to return, since it can safely handle
+	 * all of the above.
+	 */
+	jmp  int_ret_from_sys_call
 
 1:
 	subq $REST_SKIP, %rsp	# leave space for volatiles
 	CFI_ADJUST_CFA_OFFSET	REST_SKIP
 	movq %rbp, %rdi
-	call *%rbx
+	CALL_NOSPEC %rbx
 	movl $0, RAX(%rsp)
 	RESTORE_REST
 	jmp int_ret_from_sys_call
@@ -390,6 +421,7 @@ ENTRY(system_call)
 	CFI_REGISTER	rip,rcx
 	/*CFI_REGISTER	rflags,r11*/
 	SWAPGS_UNSAFE_STACK
+	SWITCH_KERNEL_CR3_NO_STACK
 	/*
 	 * A hypervisor implementation might want to use a label
 	 * after the swapgs, so that it can do the swapgs
@@ -433,9 +465,19 @@ system_call_fastpath:
 	movq %r10,%rcx
 #ifdef CONFIG_ALT_SYSCALL
 	movq TI_sys_call_table+THREAD_INFO(%rsp,RIP-ARGOFFSET),%r11
-	call *(%r11,%rax,8)
+# ifdef CONFIG_RETPOLINE
+	movq 0(%r11, %rax, 8), %rax
+	call __x86_indirect_thunk_rax
+# else
+	call *(%r11, %rax, 8)
+# endif
 #else
+# ifdef CONFIG_RETPOLINE
+  	movq sys_call_table(, %rax, 8), %rax
+	call __x86_indirect_thunk_rax
+# else
 	call *sys_call_table(,%rax,8)  # XXX:	 rip relative
+# endif
 #endif
 	movq %rax,RAX-ARGOFFSET(%rsp)
 /*
@@ -461,6 +503,14 @@ sysret_check:
 	CFI_REGISTER	rip,rcx
 	RESTORE_ARGS 1,-ARG_SKIP,0
 	/*CFI_REGISTER	rflags,r11*/
+	/*
+	 * This opens a window where we have a user CR3, but are
+	 * running in the kernel.  This makes using the CS
+	 * register useless for telling whether or not we need to
+	 * switch CR3 in NMIs.  Normal interrupts are OK because
+	 * they are off here.
+	 */
+	SWITCH_USER_CR3
 	movq	PER_CPU_VAR(old_rsp), %rsp
 	USERGS_SYSRET64
 
@@ -556,9 +606,19 @@ tracesys_phase2:
 	movq %r10,%rcx	/* fixup for C */
 #ifdef CONFIG_ALT_SYSCALL
 	movq TI_sys_call_table+THREAD_INFO(%rsp,RIP-ARGOFFSET),%r11
+# ifdef CONFIG_RETPOLINE
+	movq 0(%r11, %rax, 8), %rax
+	call __x86_indirect_thunk_rax
+# else
 	call *(%r11,%rax,8)
+# endif
 #else
+# ifdef CONFIG_RETPOLINE
+  	movq sys_call_table(, %rax, 8), %rax
+	call __x86_indirect_thunk_rax
+# else
 	call *sys_call_table(,%rax,8)
+# endif
 #endif
 	movq %rax,RAX-ARGOFFSET(%rsp)
 	/* Use IRET because user could have changed frame */
@@ -837,6 +897,14 @@ retint_swapgs:		/* return to user-space */
 	 */
 	DISABLE_INTERRUPTS(CLBR_ANY)
 	TRACE_IRQS_IRETQ
+	/*
+	 * This opens a window where we have a user CR3, but are
+	 * running in the kernel.  This makes using the CS
+	 * register useless for telling whether or not we need to
+	 * switch CR3 in NMIs.  Normal interrupts are OK because
+	 * they are off here.
+	 */
+	SWITCH_USER_CR3
 	SWAPGS
 	jmp restore_args
 
@@ -877,6 +945,7 @@ native_irq_return_ldt:
 	pushq_cfi %rax
 	pushq_cfi %rdi
 	SWAPGS
+	SWITCH_KERNEL_CR3
 	movq PER_CPU_VAR(espfix_waddr),%rdi
 	movq %rax,(0*8)(%rdi)	/* RAX */
 	movq (2*8)(%rsp),%rax	/* RIP */
@@ -892,6 +961,7 @@ native_irq_return_ldt:
 	andl $0xffff0000,%eax
 	popq_cfi %rdi
 	orq PER_CPU_VAR(espfix_stack),%rax
+	SWITCH_USER_CR3
 	SWAPGS
 	movq %rax,%rsp
 	popq_cfi %rax
@@ -1204,6 +1274,9 @@ ENTRY(xen_do_hypervisor_callback)   # do_hypervisor_callback(struct *pt_regs)
 	popq %rsp
 	CFI_DEF_CFA_REGISTER rsp
 	decl PER_CPU_VAR(irq_count)
+#ifndef CONFIG_PREEMPT
+	call xen_maybe_preempt_hcall
+#endif
 	jmp  error_exit
 	CFI_ENDPROC
 END(xen_do_hypervisor_callback)
@@ -1291,7 +1364,7 @@ trace_idtentry page_fault do_page_fault has_error_code=1
 idtentry async_page_fault do_async_page_fault has_error_code=1
 #endif
 #ifdef CONFIG_X86_MCE
-idtentry machine_check has_error_code=0 paranoid=1 do_sym=*machine_check_vector(%rip)
+idtentry machine_check do_mce has_error_code=0 paranoid=1
 #endif
 
 	/*
@@ -1306,30 +1379,41 @@ idtentry machine_check has_error_code=0 paranoid=1 do_sym=*machine_check_vector(
 	 * is fundamentally NMI-unsafe. (we cannot change the soft and
 	 * hard flags at once, atomically)
 	 */
-
-	/* ebx:	no swapgs flag */
+/*
+ * On entry: ebx=0: needs swapgs but not SWITCH_USER_CR3
+ *           ebx=1: needs neither swapgs nor SWITCH_USER_CR3
+ *           ebx=2: needs both swapgs and SWITCH_USER_CR3
+ *           ebx=3: needs SWITCH_USER_CR3 but not swapgs
+ */
 ENTRY(paranoid_exit)
 	DEFAULT_FRAME
 	DISABLE_INTERRUPTS(CLBR_NONE)
 	TRACE_IRQS_OFF_DEBUG
-	testl %ebx,%ebx				/* swapgs needed? */
-	jnz paranoid_restore
-	testl $3,CS(%rsp)
-	jnz   paranoid_userspace
-paranoid_swapgs:
-	TRACE_IRQS_IRETQ 0
-	SWAPGS_UNSAFE_STACK
-	RESTORE_ALL 8
-	jmp irq_return
-paranoid_restore:
+	movq	%rbx, %r12		/* paranoid_userspace uses %ebx */
+	testl	$3, CS(%rsp)
+	jnz	paranoid_userspace
+paranoid_kernel:
+	movq	%r12, %rbx		/* restore after paranoid_userspace */
 	TRACE_IRQS_IRETQ_DEBUG 0
+#ifdef CONFIG_PAGE_TABLE_ISOLATION
+	/* No ALTERNATIVE for X86_FEATURE_KAISER: paranoid_entry sets %ebx */
+	testl	$2, %ebx			/* SWITCH_USER_CR3 needed? */
+	jz	paranoid_exit_no_switch
+	SWITCH_USER_CR3
+paranoid_exit_no_switch:
+#endif
+	testl	$1, %ebx			/* swapgs needed? */
+	jnz	paranoid_exit_no_swapgs
+	SWAPGS_UNSAFE_STACK
+paranoid_exit_no_swapgs:
 	RESTORE_ALL 8
-	jmp irq_return
+	jmp	irq_return
+
 paranoid_userspace:
 	GET_THREAD_INFO(%rcx)
 	movl TI_flags(%rcx),%ebx
 	andl $_TIF_WORK_MASK,%ebx
-	jz paranoid_swapgs
+	jz paranoid_kernel
 	movq %rsp,%rdi			/* &pt_regs */
 	call sync_regs
 	movq %rax,%rsp			/* switch stack for scheduling */
@@ -1378,6 +1462,13 @@ ENTRY(error_entry)
 	movq %r13, R13+8(%rsp)
 	movq %r14, R14+8(%rsp)
 	movq %r15, R15+8(%rsp)
+	/*
+	 * error_entry() always returns with a kernel gsbase and
+	 * CR3.  We must also have a kernel CR3/gsbase before
+	 * calling TRACE_IRQS_*.  Just unconditionally switch to
+	 * the kernel CR3 here.
+	 */
+	SWITCH_KERNEL_CR3
 	xorl %ebx,%ebx
 	testl $3,CS+8(%rsp)
 	je error_kernelspace
@@ -1456,7 +1547,18 @@ END(error_exit)
 	/* runs on exception stack */
 ENTRY(nmi)
 	INTR_FRAME
+	/*
+	 * Fix up the exception frame if we're on Xen.
+	 * PARAVIRT_ADJUST_EXCEPTION_FRAME is guaranteed to push at most
+	 * one value to the stack on native, so it may clobber the rdx
+	 * scratch slot, but it won't clobber any of the important
+	 * slots past it.
+	 *
+	 * Xen is a different story, because the Xen frame itself overlaps
+	 * the "NMI executing" variable.
+	 */
 	PARAVIRT_ADJUST_EXCEPTION_FRAME
+
 	/*
 	 * We allow breakpoints in NMIs. If a breakpoint occurs, then
 	 * the iretq it performs will take us out of NMI context.
@@ -1508,9 +1610,16 @@ ENTRY(nmi)
 	 * we don't want to enable interrupts, because then we'll end
 	 * up in an awkward situation in which IRQs are on but NMIs
 	 * are off.
+	 *
+	 * We also must not push anything to the stack before switching
+	 * stacks lest we corrupt the "NMI executing" variable.
 	 */
 
-	SWAPGS
+	SWAPGS_UNSAFE_STACK
+	/*
+	 * percpu variables are mapped with user CR3, so no need
+	 * to switch CR3 here.
+	 */
 	cld
 	movq	%rsp, %rdx
 	movq	PER_CPU_VAR(kernel_stack), %rsp
@@ -1545,12 +1654,34 @@ ENTRY(nmi)
 
 	movq	%rsp, %rdi
 	movq	$-1, %rsi
+#ifdef CONFIG_PAGE_TABLE_ISOLATION
+	/* Unconditionally use kernel CR3 for do_nmi() */
+	/* %rax is saved above, so OK to clobber here */
+	ALTERNATIVE "jmp 2f", "movq %cr3, %rax", X86_FEATURE_KAISER
+	/* If PCID enabled, NOFLUSH now and NOFLUSH on return */
+	ALTERNATIVE "", "bts $63, %rax", X86_FEATURE_PCID
+	pushq	%rax
+	/* mask off "user" bit of pgd address and 12 PCID bits: */
+	andq	$(~(X86_CR3_PCID_ASID_MASK | KAISER_SHADOW_PGD_OFFSET)), %rax
+	movq	%rax, %cr3
+2:
+#endif
 	call	do_nmi
+
+#ifdef CONFIG_PAGE_TABLE_ISOLATION
+	/*
+	 * Unconditionally restore CR3.  I know we return to
+	 * kernel code that needs user CR3, but do we ever return
+	 * to "user mode" where we need the kernel CR3?
+	 */
+	ALTERNATIVE "", "popq %rax; movq %rax, %cr3", X86_FEATURE_KAISER
+#endif
 
 	/*
 	 * Return back to user mode.  We must *not* do the normal exit
-	 * work, because we don't want to enable interrupts.  Fortunately,
-	 * do_nmi doesn't modify pt_regs.
+	 * work, because we don't want to enable interrupts.  Do not
+	 * switch to user CR3: we might be going back to kernel code
+	 * that had a user CR3 set.
 	 */
 	SWAPGS
 
@@ -1738,23 +1869,69 @@ end_repeat_nmi:
 	subq $ORIG_RAX-R15, %rsp
 	CFI_ADJUST_CFA_OFFSET ORIG_RAX-R15
 	/*
-	 * Use save_paranoid to handle SWAPGS, but no need to use paranoid_exit
-	 * as we should not be calling schedule in NMI context.
-	 * Even with normal interrupts enabled. An NMI should not be
-	 * setting NEED_RESCHED or anything that normal interrupts and
-	 * exceptions might do.
+	 * Use the same approach as save_paranoid to handle SWAPGS, but
+	 * without CR3 handling since we do that differently in NMIs.  No
+	 * need to use paranoid_exit as we should not be calling schedule
+	 * in NMI context.  Even with normal interrupts enabled. An NMI
+	 * should not be setting NEED_RESCHED or anything that normal
+	 * interrupts and exceptions might do.
 	 */
-	call save_paranoid
-	DEFAULT_FRAME 0
+	cld
+	movq	%rdi, RDI(%rsp)
+	movq	%rsi, RSI(%rsp)
+	movq_cfi rdx, RDX
+	movq_cfi rcx, RCX
+	movq_cfi rax, RAX
+	movq	%r8, R8(%rsp)
+	movq	%r9, R9(%rsp)
+	movq	%r10, R10(%rsp)
+	movq	%r11, R11(%rsp)
+	movq_cfi rbx, RBX
+	movq	%rbp, RBP(%rsp)
+	movq	%r12, R12(%rsp)
+	movq	%r13, R13(%rsp)
+	movq	%r14, R14(%rsp)
+	movq	%r15, R15(%rsp)
+	movl	$1, %ebx
+	movl	$MSR_GS_BASE, %ecx
+	rdmsr
+	testl	%edx, %edx
+	js	1f				/* negative -> in kernel */
+	SWAPGS
+	xorl %ebx,%ebx
+1:
+	movq	%rsp,%rdi
+	movq	$-1,%rsi
+#ifdef CONFIG_PAGE_TABLE_ISOLATION
+	/* Unconditionally use kernel CR3 for do_nmi() */
+	/* %rax is saved above, so OK to clobber here */
+	ALTERNATIVE "jmp 2f", "movq %cr3, %rax", X86_FEATURE_KAISER
+	/* If PCID enabled, NOFLUSH now and NOFLUSH on return */
+	ALTERNATIVE "", "bts $63, %rax", X86_FEATURE_PCID
+	pushq	%rax
+	/* mask off "user" bit of pgd address and 12 PCID bits: */
+	andq	$(~(X86_CR3_PCID_ASID_MASK | KAISER_SHADOW_PGD_OFFSET)), %rax
+	movq	%rax, %cr3
+2:
+#endif
+	DEFAULT_FRAME 0		/* ???? */
 
 	/* paranoidentry do_nmi, 0; without TRACE_IRQS_OFF */
-	movq %rsp,%rdi
-	movq $-1,%rsi
-	call do_nmi
+	call	do_nmi
+
+#ifdef CONFIG_PAGE_TABLE_ISOLATION
+	/*
+	 * Unconditionally restore CR3.  We might be returning to
+	 * kernel code that needs user CR3, like just just before
+	 * a sysret.
+	 */
+	ALTERNATIVE "", "popq %rax; movq %rax, %cr3", X86_FEATURE_KAISER
+#endif
 
 	testl %ebx,%ebx				/* swapgs needed? */
 	jnz nmi_restore
 nmi_swapgs:
+	/* We fixed up CR3 above, so no need to switch it here */
 	SWAPGS_UNSAFE_STACK
 nmi_restore:
 	/* Pop the extra iret frame at once */

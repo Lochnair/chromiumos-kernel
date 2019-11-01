@@ -855,6 +855,29 @@ do {									       \
 #include "extents_status.h"
 
 /*
+ * Lock subclasses for i_data_sem in the ext4_inode_info structure.
+ *
+ * These are needed to avoid lockdep false positives when we need to
+ * allocate blocks to the quota inode during ext4_map_blocks(), while
+ * holding i_data_sem for a normal (non-quota) inode.  Since we don't
+ * do quota tracking for the quota inode, this avoids deadlock (as
+ * well as infinite recursion, since it isn't turtles all the way
+ * down...)
+ *
+ *  I_DATA_SEM_NORMAL - Used for most inodes
+ *  I_DATA_SEM_OTHER  - Used by move_inode.c for the second normal inode
+ *			  where the second inode has larger inode number
+ *			  than the first
+ *  I_DATA_SEM_QUOTA  - Used for quota inodes only
+ */
+enum {
+	I_DATA_SEM_NORMAL = 0,
+	I_DATA_SEM_OTHER,
+	I_DATA_SEM_QUOTA,
+};
+
+
+/*
  * fourth extended file system inode data in memory
  */
 struct ext4_inode_info {
@@ -1440,11 +1463,6 @@ static inline struct timespec ext4_current_time(struct inode *inode)
 static inline int ext4_valid_inum(struct super_block *sb, unsigned long ino)
 {
 	return ino == EXT4_ROOT_INO ||
-		ino == EXT4_USR_QUOTA_INO ||
-		ino == EXT4_GRP_QUOTA_INO ||
-		ino == EXT4_BOOT_LOADER_INO ||
-		ino == EXT4_JOURNAL_INO ||
-		ino == EXT4_RESIZE_INO ||
 		(ino >= EXT4_FIRST_INO(sb) &&
 		 ino <= le32_to_cpu(EXT4_SB(sb)->s_es->s_inodes_count));
 }
@@ -1747,7 +1765,6 @@ EXT4_FEATURE_INCOMPAT_FUNCS(encrypt,		ENCRYPT)
 					 EXT4_FEATURE_INCOMPAT_64BIT| \
 					 EXT4_FEATURE_INCOMPAT_FLEX_BG| \
 					 EXT4_FEATURE_INCOMPAT_MMP | \
-					 EXT4_FEATURE_INCOMPAT_INLINE_DATA | \
 					 EXT4_FEATURE_INCOMPAT_ENCRYPT | \
 					 EXT4_FEATURE_INCOMPAT_CSUM_SEED)
 #define EXT4_FEATURE_RO_COMPAT_SUPP	(EXT4_FEATURE_RO_COMPAT_SPARSE_SUPER| \
@@ -2305,23 +2322,11 @@ static inline void ext4_fname_free_filename(struct ext4_filename *fname) { }
 /* crypto_key.c */
 void ext4_free_crypt_info(struct ext4_crypt_info *ci);
 void ext4_free_encryption_info(struct inode *inode, struct ext4_crypt_info *ci);
-int _ext4_get_encryption_info(struct inode *inode);
 
 #ifdef CONFIG_EXT4_FS_ENCRYPTION
 int ext4_has_encryption_key(struct inode *inode);
 
-static inline int ext4_get_encryption_info(struct inode *inode)
-{
-	struct ext4_crypt_info *ci = EXT4_I(inode)->i_crypt_info;
-
-	if (!ci ||
-	    (ci->ci_keyring_key &&
-	     (ci->ci_keyring_key->flags & ((1 << KEY_FLAG_INVALIDATED) |
-					   (1 << KEY_FLAG_REVOKED) |
-					   (1 << KEY_FLAG_DEAD)))))
-		return _ext4_get_encryption_info(inode);
-	return 0;
-}
+int ext4_get_encryption_info(struct inode *inode);
 
 static inline struct ext4_crypt_info *ext4_encryption_info(struct inode *inode)
 {
@@ -3007,9 +3012,6 @@ extern struct buffer_head *ext4_get_first_inline_block(struct inode *inode,
 extern int ext4_inline_data_fiemap(struct inode *inode,
 				   struct fiemap_extent_info *fieinfo,
 				   int *has_inline);
-extern int ext4_try_to_evict_inline_data(handle_t *handle,
-					 struct inode *inode,
-					 int needed);
 extern void ext4_inline_data_truncate(struct inode *inode, int *has_inline);
 
 extern int ext4_convert_inline_data(struct inode *inode);

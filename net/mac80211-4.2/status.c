@@ -184,9 +184,13 @@ static void ieee80211_frame_acked(struct sta_info *sta, struct sk_buff *skb)
 	struct ieee80211_mgmt *mgmt = (void *) skb->data;
 	struct ieee80211_local *local = sta->local;
 	struct ieee80211_sub_if_data *sdata = sta->sdata;
+	struct ieee80211_tx_info *info = IEEE80211_SKB_CB(skb);
 
-	if (ieee80211_hw_check(&local->hw, REPORTS_TX_ACK_STATUS))
+	if (ieee80211_hw_check(&local->hw, REPORTS_TX_ACK_STATUS)) {
 		sta->last_rx = jiffies;
+		ewma_add(&sta->ave_data_rssi,
+			 -(info->status.ack_signal));
+	}
 
 	if (ieee80211_is_data_qos(mgmt->frame_control)) {
 		struct ieee80211_hdr *hdr = (void *) skb->data;

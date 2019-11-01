@@ -25,6 +25,7 @@
 #include <linux/usb.h>
 #include <linux/firmware.h>
 #include <asm/unaligned.h>
+#include <linux/delay.h>
 
 #include <net/bluetooth/bluetooth.h>
 #include <net/bluetooth/hci_core.h>
@@ -1664,6 +1665,16 @@ static int btusb_setup_intel(struct hci_dev *hdev)
 
 	BT_DBG("%s", hdev->name);
 
+	/* Observed race condition during controller recovery mechanism
+	 * resulting the controller not responding to the reset command.
+	 *
+	 * To avoid such race condition need a delay of 30ms soon after the
+	 * USB re-enumeration and before sending the Reset command which shall
+	 * allow controller to completely recover and process the Reset command.
+	 */
+	BT_DBG("Delay 30ms to avoid race condition");
+	mdelay(30);
+
 	/* The controller has a bug with the first HCI command sent to it
 	 * returning number of completed commands as zero. This would stall the
 	 * command processing in the Bluetooth core.
@@ -1755,6 +1766,11 @@ static int btusb_setup_intel(struct hci_dev *hdev)
 						 &disable_patch);
 		if (ret < 0)
 			goto exit_mfg_deactivate;
+		/* For each memory write controller need at least 2 ms to
+		 * realize the write is complete before it receives one
+		 * more write.
+		 */
+		mdelay(2);
 	}
 
 	release_firmware(fw);
@@ -1764,7 +1780,10 @@ static int btusb_setup_intel(struct hci_dev *hdev)
 
 	/* Patching completed successfully and disable the manufacturer mode
 	 * with reset and activate the downloaded firmware patches.
+	 * 8ms delay - Once firmware patch download complete, controller needs
+	 * 8ms to validate the patches.
 	 */
+	mdelay(8);
 	err = btintel_exit_mfg(hdev, true, true);
 	if (err)
 		return err;
@@ -2321,6 +2340,22 @@ static int btusb_shutdown_intel(struct hci_dev *hdev)
 {
 	struct sk_buff *skb;
 	long ret;
+
+	/* In the shutdown sequence where Bluetooth is turned off followed
+	 * by WiFi being turned off, turning WiFi back on causes issue with
+	 * the RF calibration.
+	 *
+	 * To ensure that any RF activity has been stopped, issue HCI Reset
+	 * command to clear all ongoing activity including advertising,
+	 * scanning etc.
+	 */
+	skb = __hci_cmd_sync(hdev, HCI_OP_RESET, 0, NULL, HCI_INIT_TIMEOUT);
+	if (IS_ERR(skb)) {
+		ret = PTR_ERR(skb);
+		bt_dev_err(hdev, "HCI reset during shutdown failed");
+		return ret;
+	}
+	kfree_skb(skb);
 
 	/* Some platforms have an issue with BT LED when the interface is
 	 * down or BT radio is turned off, which takes 5 seconds to BT LED
@@ -2885,7 +2920,13 @@ static int btusb_probe(struct usb_interface *intf,
 		hdev->shutdown = btusb_shutdown_intel;
 		hdev->set_diag = btintel_set_diag_mfg;
 		hdev->set_bdaddr = btintel_set_bdaddr;
+#ifdef CONFIG_BT_EVE_HACKS
+		/* HCI_QUIRK_STRICT_DUPLICATE_FILTER is removed due to the
+		 * conflict of intention within BlueZ kernel.
+		 */
+#else
 		set_bit(HCI_QUIRK_STRICT_DUPLICATE_FILTER, &hdev->quirks);
+#endif
 		set_bit(HCI_QUIRK_SIMULTANEOUS_DISCOVERY, &hdev->quirks);
 		set_bit(HCI_QUIRK_NON_PERSISTENT_DIAG, &hdev->quirks);
 	}
@@ -2897,7 +2938,13 @@ static int btusb_probe(struct usb_interface *intf,
 		hdev->hw_error = btintel_hw_error;
 		hdev->set_diag = btintel_set_diag;
 		hdev->set_bdaddr = btintel_set_bdaddr;
+#ifdef CONFIG_BT_EVE_HACKS
+		/* HCI_QUIRK_STRICT_DUPLICATE_FILTER is removed due to the
+		 * conflict of intention within BlueZ kernel.
+		 */
+#else
 		set_bit(HCI_QUIRK_STRICT_DUPLICATE_FILTER, &hdev->quirks);
+#endif
 		set_bit(HCI_QUIRK_NON_PERSISTENT_DIAG, &hdev->quirks);
 	}
 
@@ -3022,6 +3069,9 @@ static int btusb_probe(struct usb_interface *intf,
 	}
 
 	usb_set_intfdata(intf, data);
+
+	hdev->controller_id.idVendor = id->idVendor;
+	hdev->controller_id.idProduct = id->idProduct;
 
 	return 0;
 }

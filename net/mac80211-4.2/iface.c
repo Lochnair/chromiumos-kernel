@@ -1115,7 +1115,7 @@ ieee80211_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *stats)
 
 	for_each_possible_cpu(i) {
 		const struct pcpu_sw_netstats *tstats;
-		u64 rx_packets, rx_bytes, tx_packets, tx_bytes;
+		u64 rx_packets, rx_bytes, tx_packets, tx_bytes, multicast;
 		unsigned int start;
 
 		tstats = per_cpu_ptr(dev->tstats, i);
@@ -1126,12 +1126,14 @@ ieee80211_get_stats64(struct net_device *dev, struct rtnl_link_stats64 *stats)
 			tx_packets = tstats->tx_packets;
 			rx_bytes = tstats->rx_bytes;
 			tx_bytes = tstats->tx_bytes;
+			multicast = tstats->multicast;
 		} while (u64_stats_fetch_retry_irq(&tstats->syncp, start));
 
 		stats->rx_packets += rx_packets;
 		stats->tx_packets += tx_packets;
 		stats->rx_bytes   += rx_bytes;
 		stats->tx_bytes   += tx_bytes;
+		stats->multicast  += multicast;
 	}
 
 	return stats;
@@ -1823,6 +1825,12 @@ int ieee80211_if_add(struct ieee80211_local *local, const char *name,
 	sdata->user_power_level = local->user_power_level;
 
 	sdata->encrypt_headroom = IEEE80211_ENCRYPT_HEADROOM;
+
+	/* multicast and broadcast RX limit logic is disabled by default */
+	sdata->mc_rx_limit_rate = 0;
+	sdata->bc_rx_limit_rate = 0;
+	/* set the default burst size as 5 times of Frame length */
+	sdata->burst_size = IEEE80211_MAX_FRAME_LEN * 5;
 
 	/* setup type-dependent data */
 	ieee80211_setup_sdata(sdata, type);

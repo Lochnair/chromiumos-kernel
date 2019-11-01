@@ -20,5 +20,6 @@ bluetooth-$(CONFIG_BT_HS) += a2mp.o amp.o
 bluetooth-$(CONFIG_BT_LEDS) += leds.o
 bluetooth-$(CONFIG_BT_DEBUGFS) += hci_debugfs.o
 bluetooth-$(CONFIG_BT_SELFTEST) += selftest.o
+bluetooth-$(CONFIG_BT_HCI_LE_SPLITTER) += hci_le_splitter.o
 
 subdir-ccflags-y += -D__CHECK_ENDIAN__

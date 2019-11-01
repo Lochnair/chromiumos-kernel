@@ -763,6 +763,19 @@ static int ath10k_mac_set_rts(struct ath10k_vif *arvif, u32 value)
 	return ath10k_wmi_vdev_set_param(ar, arvif->vdev_id, vdev_param, value);
 }
 
+static int ath10k_vdev_set_ftm_resp(struct ath10k_vif *arvif)
+{
+	struct ath10k *ar = arvif->ar;
+	u32 vdev_param;
+	int value;
+
+	vdev_param = ar->wmi.vdev_param->rtt_responder_role;
+	value = ar->debug.ftmr_enabled[arvif->vdev_id];
+	return ath10k_wmi_vdev_set_param(ar, arvif->vdev_id,
+					 vdev_param,
+					 value);
+}
+
 static int ath10k_peer_delete(struct ath10k *ar, u32 vdev_id, const u8 *addr)
 {
 	int ret;
@@ -3677,18 +3690,24 @@ void ath10k_mgmt_over_wmi_tx_work(struct work_struct *work)
 	}
 }
 
-static void atf_scheduler_init(struct ieee80211_txq *txq)
+static void atf_scheduler_init(struct ath10k_vif *arvif,
+			       struct ieee80211_txq *txq)
 {
 	struct ath10k_txq *artxq = (void *)txq->drv_priv;
 	struct atf_scheduler *atf = &artxq->atf;
 
-	atf->quantum = IEEE80211_ATF_QUANTUM;
-	atf->deficit = IEEE80211_ATF_QUANTUM;
+	if (ieee80211_vif_is_mesh(arvif->vif))
+		atf->quantum = arvif->ar->atf_quantum_mesh[txq->tid];
+	else
+		atf->quantum = arvif->ar->atf_quantum[txq->tid];
+
+	atf->deficit = atf->quantum;
 	atf->deficit_max = atf->quantum + atf->quantum / 4;
 	atf->next_epoch = codel_get_time() + IEEE80211_ATF_TXQ_AIRTIME_MIN;
 }
 
-static void ath10k_mac_txq_init(struct ieee80211_txq *txq)
+static void ath10k_mac_txq_init(struct ath10k_vif *arvif,
+				struct ieee80211_txq *txq)
 {
 	struct ath10k_txq *artxq;
 
@@ -3697,7 +3716,7 @@ static void ath10k_mac_txq_init(struct ieee80211_txq *txq)
 
 	artxq = (void *)txq->drv_priv;
 	INIT_LIST_HEAD(&artxq->list);
-	atf_scheduler_init(txq);
+	atf_scheduler_init(arvif, txq);
 }
 
 static void ath10k_mac_txq_unref(struct ath10k *ar, struct ieee80211_txq *txq)
@@ -3766,11 +3785,6 @@ void ath10k_atf_refill_deficit(struct ath10k *ar)
 	if (ar->htt.num_pending_tx == 0)
 		ar->airtime_inflight = 0;
 
-	if (ar->airtime_inflight < ar->atf_release_limit)
-		release_limit = IEEE80211_ATF_TXQ_AIRTIME_MAX;
-	else
-		release_limit = IEEE80211_ATF_TXQ_AIRTIME_MIN;
-
 	/* Replenish deficit for all active queues if the frames it released
 	 * to firmware has estimated airtime less than release_limit.
 	 */
@@ -3778,8 +3792,15 @@ void ath10k_atf_refill_deficit(struct ath10k *ar)
 		txq = container_of((void *)artxq, struct ieee80211_txq,
 				   drv_priv);
 		atf = &artxq->atf;
-		if ((atf->airtime_inflight < release_limit) ||
-		    ((reset_deficit) && (atf->bytes_send == 0)))
+
+		if (ar->airtime_inflight < ar->atf_release_limit)
+			release_limit = ar->atf_txq_limit_max[txq->tid];
+		else
+			release_limit = ar->atf_txq_limit_min[txq->tid];
+
+		if ((atf->airtime_inflight < release_limit) || reset_deficit ||
+		    ((atf->frames_inflight == ar->htt.num_pending_tx) &&
+		    (atf->airtime_inflight < ar->atf_release_limit)))
 			atf->deficit += atf->quantum;
 		if (reset_deficit) {
 			if (atf->deficit < 0)
@@ -3787,6 +3808,10 @@ void ath10k_atf_refill_deficit(struct ath10k *ar)
 			atf->bytes_send_last_interval = atf->bytes_send;
 			atf->bytes_send = 0;
 		}
+
+		/* To prvent station with very low phy rate from straving */
+		if ((atf->deficit < 0) && (atf->frames_inflight == 0))
+			atf->deficit = 0;
 
 		if (atf->deficit > atf->deficit_max)
 			atf->deficit = atf->deficit_max;
@@ -3856,10 +3881,16 @@ u32 ath10k_atf_update_airtime(struct ath10k *ar, struct ieee80211_txq *txq,
 	pktlen = skb->len + 38; /* Assume MAC header 30, SNAP 8 for most case */
 	if (txq && txq->sta && txq->sta->last_tx_bitrate) {
 		/* airtime in us, last_tx_bitrate in 100kbps */
-		airtime = (skb->len * 8 * (1000 / 100))
+		airtime = (pktlen * 8 * (1000 / 100))
 				/ txq->sta->last_tx_bitrate;
 	} else {
 		overhead = IEEE80211_ATF_OVERHEAD;
+		/* This is mostly for throttle excessive BC/MC frames, and the
+		 * airtime/rate doesn't need be exact. Airtime of BC/MC frames
+		 * in 2G get some discount, which helps prevent very low rate
+		 * frames from being blocked for too long.
+		 */
+		airtime = (pktlen * 8 * (1000 / 100)) / 60; /* 6M */
 	}
 
 	airtime += overhead;
@@ -3870,6 +3901,9 @@ u32 ath10k_atf_update_airtime(struct ath10k *ar, struct ieee80211_txq *txq,
 	atf->frames_inflight++;
 	atf->airtime_inflight += airtime;
 	trace_ath10k_atf_upd(ar, airtime, skb, txq);
+
+	if (ar->htt.num_pending_tx > ar->atf_max_num_pending_tx)
+		ar->atf_max_num_pending_tx = ar->htt.num_pending_tx;
 
 	spin_unlock_bh(&ar->htt.tx_lock);
 	return airtime;
@@ -4277,8 +4311,10 @@ static void ath10k_mac_op_wake_tx_queue(struct ieee80211_hw *hw,
 
 	if (ath10k_atf_scheduler_enabled(ar)) {
 		rcu_read_lock();
-		if ((f_artxq->atf.deficit < 0) &&
-		    (f_artxq->atf.frames_inflight <= 1)) {
+		if (f_artxq->atf.deficit < 0 && (f_artxq->atf.airtime_inflight
+		    < ar->atf_txq_limit_max[f_txq->tid] ||
+		    codel_time_after(codel_get_time(), f_artxq->atf.next_epoch)
+		)) {
 			ath10k_atf_refill_deficit(ar);
 		}
 		while ((f_artxq->atf.deficit < 0)) {
@@ -4600,6 +4636,7 @@ static int ath10k_start(struct ieee80211_hw *hw)
 	u32 param;
 	u32 default_antenna_config;
 	int ret = 0;
+	u32 ac, burst_dur[] = {5500, 6000, 2000, 2000};
 
 	/*
 	 * This makes sense only when restarting hw. It is harmless to call
@@ -4733,6 +4770,25 @@ static int ath10k_start(struct ieee80211_hw *hw)
 		if (ret) {
 			ath10k_warn(ar, "failed to set default antenna : %d\n",
 				    ret);
+		}
+	}
+
+	if (ar->phy_capability &
+	    WHAL_WLAN_11A_CAPABILITY) {
+		for (ac = 0; ac < IEEE80211_NUM_ACS; ac++) {
+			if (ar->burst_dur[ac] == 0)
+				ar->burst_dur[ac] = burst_dur[ac];
+
+			ret = ath10k_wmi_pdev_set_param(
+					ar, ar->wmi.pdev_param->aggr_burst,
+					(SM(ac, ATH10K_AGGR_BURST_AC) |
+					 SM(ar->burst_dur[ac],
+					    ATH10K_AGGR_BURST_DUR)));
+			if (ret)
+				ath10k_warn(
+				    ar,
+				    "set aggr burst dur failed for ac %d: %d\n",
+				    ac, ret);
 		}
 	}
 
@@ -4950,10 +5006,10 @@ static int ath10k_add_interface(struct ieee80211_hw *hw,
 	mutex_lock(&ar->conf_mutex);
 
 	memset(arvif, 0, sizeof(*arvif));
-	ath10k_mac_txq_init(vif->txq);
 
 	arvif->ar = ar;
 	arvif->vif = vif;
+	ath10k_mac_txq_init(arvif, vif->txq);
 
 	INIT_LIST_HEAD(&arvif->list);
 	INIT_WORK(&arvif->ap_csa_work, ath10k_mac_vif_ap_csa_work);
@@ -5216,6 +5272,16 @@ static int ath10k_add_interface(struct ieee80211_hw *hw,
 		goto err_peer_delete;
 	}
 
+	/* disable FTM responder by default */
+	if (ar->debug.ftmr_enabled[arvif->vdev_id] == -1)
+		ar->debug.ftmr_enabled[arvif->vdev_id] = 0;
+
+	ret = ath10k_vdev_set_ftm_resp(arvif);
+	/* It is harmless to not set FTM resp mode. so donot delete peer */
+	if (ret && ret != -EOPNOTSUPP)
+		ath10k_warn(ar, "failed to set ftm resp for vdev %d: %d\n",
+			    arvif->vdev_id, ret);
+
 	arvif->txpower = vif->bss_conf.txpower;
 	ret = ath10k_mac_txpower_recalc(ar);
 	if (ret) {
@@ -5383,6 +5449,7 @@ static void ath10k_remove_interface(struct ieee80211_hw *hw,
 	}
 	spin_unlock_bh(&ar->data_lock);
 
+	ar->debug.ftmr_enabled[arvif->vdev_id] = -1;
 	ath10k_peer_cleanup(ar, arvif->vdev_id);
 	ath10k_mac_txq_unref(ar, vif->txq);
 
@@ -6115,7 +6182,7 @@ static int ath10k_sta_state(struct ieee80211_hw *hw,
 		INIT_WORK(&arsta->update_wk, ath10k_sta_rc_update_wk);
 
 		for (i = 0; i < ARRAY_SIZE(sta->txq); i++)
-			ath10k_mac_txq_init(sta->txq[i]);
+			ath10k_mac_txq_init(arvif, sta->txq[i]);
 	}
 
 	/* cancel must be done outside the mutex to avoid deadlock */
@@ -6505,13 +6572,16 @@ static int ath10k_conf_tx(struct ieee80211_hw *hw,
 	p->cwmin = params->cw_min;
 	p->cwmax = params->cw_max;
 	p->aifs = params->aifs;
+	p->no_ack = params->noack;
 
 	/*
 	 * The channel time duration programmed in the HW is in absolute
 	 * microseconds, while mac80211 gives the txop in units of
 	 * 32 microseconds.
 	 */
-	p->txop = params->txop * 32;
+	if (params->txop != 0xffff) {
+		p->txop = params->txop * 32;
+	}
 
 	if (ar->wmi.ops->gen_vdev_wmm_conf) {
 		ret = ath10k_wmi_vdev_wmm_conf(ar, arvif->vdev_id,

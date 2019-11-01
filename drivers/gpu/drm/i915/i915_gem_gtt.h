@@ -149,7 +149,7 @@ struct i915_ggtt_view {
 
 	union {
 		struct {
-			unsigned long offset;
+			u64 offset;
 			unsigned int size;
 		} partial;
 	} params;
@@ -341,6 +341,7 @@ struct i915_gtt {
 	struct i915_address_space base;
 
 	size_t stolen_size;		/* Total size of stolen memory */
+	size_t stolen_usable_size;	/* Total size minus BIOS reserved */
 	u64 mappable_end;		/* End offset that we can CPU map */
 	struct io_mapping *mappable;	/* Mapping to our CPU mappable region */
 	phys_addr_t mappable_base;	/* PA of our GMADR */

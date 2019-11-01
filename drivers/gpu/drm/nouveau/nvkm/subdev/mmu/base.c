@@ -736,7 +736,7 @@ int nvkm_vm_fence(struct nvkm_vm *vm, struct fence *fence)
 	int ret = 0;
 	struct sync_fence *f;
 
-	f = sync_fence_create("nv-pushbuf", fence_get(fence));
+	f = sync_fence_create_dma("nv-pushbuf", fence_get(fence));
 	if (!f)
 		return -ENOMEM;
 

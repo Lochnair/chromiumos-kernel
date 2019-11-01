@@ -311,8 +311,8 @@ lookup_protocol:
 	}
 
 	err = -EPERM;
-	if (sock->type == SOCK_RAW && !kern && !ns_capable(net->user_ns,
-							   CAP_NET_RAW))
+	if (sock->type == SOCK_RAW && !kern &&
+	    !android_ns_capable(net, CAP_NET_RAW))
 		goto out_rcu_unlock;
 
 	sock->ops = answer->ops;
@@ -389,6 +389,26 @@ out_rcu_unlock:
 }
 
 
+/* A notification chain invoked when a socket is released. The action parameter
+ * passed to notification callbacks is always 0, the data parameter is the
+ * struct socket being released.
+ */
+static BLOCKING_NOTIFIER_HEAD(inet_release_notifier_chain);
+
+int inet_release_notifier_register(struct notifier_block *nb)
+{
+	return blocking_notifier_chain_register(&inet_release_notifier_chain,
+						nb);
+}
+EXPORT_SYMBOL(inet_release_notifier_register);
+
+int inet_release_notifier_unregister(struct notifier_block *nb)
+{
+	return blocking_notifier_chain_unregister(&inet_release_notifier_chain,
+						  nb);
+}
+EXPORT_SYMBOL(inet_release_notifier_unregister);
+
 /*
  *	The peer socket should always be NULL (or else). When we call this
  *	function we are destroying the object and from then on nobody
@@ -400,6 +420,10 @@ int inet_release(struct socket *sock)
 
 	if (sk) {
 		long timeout;
+
+		/* Ignore return value: inet_release must complete. */
+		blocking_notifier_call_chain(&inet_release_notifier_chain, 0,
+					     sock);
 
 		sock_rps_reset_flow(sk);
 
@@ -874,7 +898,6 @@ int inet_ioctl(struct socket *sock, unsigned int cmd, unsigned long arg)
 	case SIOCSIFPFLAGS:
 	case SIOCGIFPFLAGS:
 	case SIOCSIFFLAGS:
-	case SIOCKILLADDR:
 		err = devinet_ioctl(net, cmd, (void __user *)arg);
 		break;
 	default:

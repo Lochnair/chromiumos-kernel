@@ -30,7 +30,7 @@ static ssize_t ieee80211_if_read(
 	size_t count, loff_t *ppos,
 	ssize_t (*format)(const struct ieee80211_sub_if_data *, char *, int))
 {
-	char buf[70];
+	char buf[200];
 	ssize_t ret = -EINVAL;
 
 	read_lock(&dev_base_lock);
@@ -436,6 +436,38 @@ static ssize_t ieee80211_if_fmt_num_buffered_multicast(
 }
 IEEE80211_IF_FILE_R(num_buffered_multicast);
 
+static ssize_t ieee80211_if_fmt_aqm(
+	const struct ieee80211_sub_if_data *sdata, char *buf, int buflen)
+{
+	struct ieee80211_local *local = sdata->local;
+	struct txq_info *txqi = to_txq_info(sdata->vif.txq);
+	int len;
+
+	spin_lock_bh(&local->fq.lock);
+	rcu_read_lock();
+
+	len = scnprintf(buf,
+			buflen,
+			"ac backlog-bytes backlog-packets new-flows drops marks overlimit collisions tx-bytes tx-packets\n"
+			"%u %u %u %u %u %u %u %u %u %u\n",
+			txqi->txq.ac,
+			txqi->tin.backlog_bytes,
+			txqi->tin.backlog_packets,
+			txqi->tin.flows,
+			txqi->cstats.drop_count,
+			txqi->cstats.ecn_mark,
+			txqi->tin.overlimit,
+			txqi->tin.collisions,
+			txqi->tin.tx_bytes,
+			txqi->tin.tx_packets);
+
+	rcu_read_unlock();
+	spin_unlock_bh(&local->fq.lock);
+
+	return len;
+}
+IEEE80211_IF_FILE_R(aqm);
+
 /* IBSS attributes */
 static ssize_t ieee80211_if_fmt_tsf(
 	const struct ieee80211_sub_if_data *sdata, char *buf, int buflen)
@@ -488,6 +520,127 @@ static ssize_t ieee80211_if_parse_tsf(
 }
 IEEE80211_IF_FILE_RW(tsf);
 
+/* Updates the interface RX limits to all the STA's connected */
+static void update_rx_limit(struct ieee80211_sub_if_data *sdata,
+			    struct sta_info *sta)
+{
+	list_for_each_entry(sta, &sdata->local->sta_list, list) {
+		sta->mc_rx_limit.rate = sdata->mc_rx_limit_rate;
+		sta->bc_rx_limit.rate = sdata->bc_rx_limit_rate;
+
+		/* Calculate the bc/mc receive frame burst size */
+		mc_bc_burst_size(sta);
+	}
+}
+
+static ssize_t ieee80211_if_fmt_mc_bc_rx_limit(
+	const struct ieee80211_sub_if_data *sdata, char *buf, int buflen)
+{
+	return scnprintf(buf, buflen, "mc: %u\nbc: %u\nburst_size: %u\n",
+			 sdata->mc_rx_limit_rate, sdata->bc_rx_limit_rate,
+			 sdata->burst_size);
+}
+
+static ssize_t ieee80211_if_parse_mc_bc_rx_limit(
+	struct ieee80211_sub_if_data *sdata, const char *buf, int buflen)
+{
+	struct sta_info *sta;
+	int ret;
+	bool mc = false, bc = false;
+	u32 rate = 0, burst_size = 0;
+
+	if (strncmp(buf, "mc:", 3) == 0) {
+		buf += 3;
+		mc = true;
+	} else if (strncmp(buf, "bc:", 3) == 0) {
+		buf += 3;
+		bc = true;
+	} else if (strncmp(buf, "reset", 5) == 0) {
+		/* Disables the multicast and broadcast RX limit logic */
+		sdata->mc_rx_limit_rate = 0;
+		sdata->bc_rx_limit_rate = 0;
+		update_rx_limit(sdata, sta);
+	} else if (strncmp(buf, "burst_size:", 11) == 0) {
+		ret = kstrtouint(buf + 11, 0, &burst_size);
+		if (ret < 0)
+			return ret;
+		sdata->burst_size = burst_size;
+	} else {
+		return -EINVAL;
+	}
+
+	if (mc || bc) {
+		ret = kstrtouint(buf, 0, &rate);
+		if (ret < 0)
+			return ret;
+		/* Allow the rates less than 100000Kbps(100Mbps) */
+		if (rate <= 100000) {
+			mc > bc ? (sdata->mc_rx_limit_rate = rate) :
+				  (sdata->bc_rx_limit_rate = rate);
+			update_rx_limit(sdata, sta);
+		} else {
+			return -EINVAL;
+		}
+	}
+	return buflen;
+}
+
+IEEE80211_IF_FILE_RW(mc_bc_rx_limit);
+
+static ssize_t ieee80211_if_parse_wmm_param(
+	struct ieee80211_sub_if_data *sdata,
+	const char *user_buf, int count)
+{
+	struct ieee80211_local *local = sdata->local;
+	char buf[100];
+	size_t len;
+	u32 ac, cwmin, cwmax, aifs, noack;
+	struct ieee80211_tx_queue_params params;
+
+	if (count > (sizeof(buf) - 1))
+		count = sizeof(buf) - 1;
+
+	memcpy(buf, user_buf, count);
+
+	buf[sizeof(buf) - 1] = '\0';
+	len = strlen(buf);
+	if (len > 0 && buf[len - 1] == '\n')
+		buf[len - 1] = 0;
+
+	if (sscanf(buf, "ac %d cwmin %d cwmax %d aifs %d noack %d", &ac, &cwmin,
+		   &cwmax, &aifs, &noack) != 5) {
+		sdata_err(sdata,
+			  "wmm_param: failed to get param");
+		return -EINVAL;
+	}
+
+	params.cw_min = cwmin;
+	params.cw_max = cwmax;
+	params.aifs = aifs;
+	params.noack = noack;
+	params.txop = 0xffff;
+
+	switch (ac) {
+	case 0:
+		ac = IEEE80211_AC_BE;
+		break;
+	case 1:
+		ac = IEEE80211_AC_BK;
+		break;
+	case 2:
+		ac = IEEE80211_AC_VI;
+		break;
+	case 3:
+		ac = IEEE80211_AC_VO;
+		break;
+	}
+
+	drv_conf_tx(local, sdata, ac, &params);
+
+	return count;
+}
+
+IEEE80211_IF_FILE_W(wmm_param);
 
 /* WDS attributes */
 IEEE80211_IF_FILE(peer, u.wds.remote_addr, MAC);
@@ -594,6 +747,9 @@ static void add_common_files(struct ieee80211_sub_if_data *sdata)
 	DEBUGFS_ADD(rc_rateidx_mcs_mask_2ghz);
 	DEBUGFS_ADD(rc_rateidx_mcs_mask_5ghz);
 	DEBUGFS_ADD(hw_queues);
+
+	if (sdata->local->ops->wake_tx_queue)
+		DEBUGFS_ADD(aqm);
 }
 
 static void add_sta_files(struct ieee80211_sub_if_data *sdata)
@@ -608,6 +764,7 @@ static void add_sta_files(struct ieee80211_sub_if_data *sdata)
 	DEBUGFS_ADD_MODE(beacon_loss, 0200);
 	DEBUGFS_ADD_MODE(uapsd_queues, 0600);
 	DEBUGFS_ADD_MODE(uapsd_max_sp_len, 0600);
+	DEBUGFS_ADD_MODE(wmm_param, 0200);
 }
 
 static void add_ap_files(struct ieee80211_sub_if_data *sdata)
@@ -618,6 +775,7 @@ static void add_ap_files(struct ieee80211_sub_if_data *sdata)
 	DEBUGFS_ADD(dtim_count);
 	DEBUGFS_ADD(num_buffered_multicast);
 	DEBUGFS_ADD_MODE(tkip_mic_test, 0200);
+	DEBUGFS_ADD_MODE(wmm_param, 0200);
 }
 
 static void add_ibss_files(struct ieee80211_sub_if_data *sdata)
@@ -637,6 +795,7 @@ static void add_mesh_files(struct ieee80211_sub_if_data *sdata)
 	DEBUGFS_ADD_MODE(tsf, 0600);
 	DEBUGFS_ADD_MODE(estab_plinks, 0400);
 	DEBUGFS_ADD_MODE(path_switch_threshold, 0600);
+	DEBUGFS_ADD_MODE(wmm_param, 0200);
 }
 
 static void add_mesh_stats(struct ieee80211_sub_if_data *sdata)
@@ -703,6 +862,7 @@ static void add_files(struct ieee80211_sub_if_data *sdata)
 	DEBUGFS_ADD(txpower);
 	DEBUGFS_ADD(user_power_level);
 	DEBUGFS_ADD(ap_power_level);
+	DEBUGFS_ADD(mc_bc_rx_limit);
 
 	if (sdata->vif.type != NL80211_IFTYPE_MONITOR)
 		add_common_files(sdata);

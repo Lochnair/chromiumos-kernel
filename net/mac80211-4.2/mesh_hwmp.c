@@ -20,7 +20,28 @@
 
 #define MAX_PREQ_QUEUE_LEN	64
 
+/* minimum link metric averaging time constant in milliseconds */
+#define MIN_MESH_TIME_CONST	400
+
 static void mesh_queue_preq(struct mesh_path *, u8);
+
+/**
+ * mesh_find_time_constant - determine mesh time constant
+ *
+ * Determine appropriate mesh time constant based on jiffy
+ * value which is used as link metric averaging time constant.
+ *
+ * Return: mesh time constant.
+ */
+static u32 mesh_find_time_constant(void)
+{
+	u32 constant = 0, itr = 0;
+
+	for (itr = 0; (constant = (1 << itr) * jiffies_to_msecs(1)); itr++)
+		if (constant > MIN_MESH_TIME_CONST)
+			break;
+	return msecs_to_jiffies(constant);
+}
 
 static inline u32 u32_field_get(const u8 *preq_elem, int offset, bool ae)
 {
@@ -307,8 +328,6 @@ int mesh_path_error_tx(struct ieee80211_sub_if_data *sdata,
  * average. The moving average gives more weights to sparse samples and
  * less weights to dense samples (in time). See go/js-mlm-v2.
  */
- /* mesh link metric averaging time constant, must be power of 2 */
-#define MESH_TIME_CONST msecs_to_jiffies(640)
 /* constant weight, approximation of 1-e^-1 (0.6322) */
 #define CONST_WEIGHT 3 / 5
 #define V1_WEIGHT 5 / 100
@@ -652,7 +671,6 @@ static u32 hwmp_route_info_get(struct ieee80211_sub_if_data *sdata,
 	rcu_read_unlock();
 	if (mpath_table_updated) {
 		mesh_path_table_debug_dump(sdata);
-		cfg80211_new_mpath(sdata->dev, dest, GFP_KERNEL);
 	}
 	return process ? new_metric : 0;
 }
@@ -1393,9 +1411,12 @@ void mesh_path_tx_root_frame(struct ieee80211_sub_if_data *sdata)
 
 void mesh_hwmp_init(void)
 {
-	WARN_ON(!is_power_of_2(MESH_TIME_CONST));
+	/* mesh link metric averaging time constant, must be power of 2 */
+	const u32 mesh_time_constant = mesh_find_time_constant();
 
-	time_const = MESH_TIME_CONST << ARITH_SHIFT;
-	time_const_shift = ilog2(MESH_TIME_CONST) + ARITH_SHIFT;
-	max_shifted_weight = (MESH_TIME_CONST << ARITH_SHIFT) * V1_WEIGHT;
+	WARN_ON(!is_power_of_2(mesh_time_constant));
+
+	time_const = mesh_time_constant << ARITH_SHIFT;
+	time_const_shift = ilog2(mesh_time_constant) + ARITH_SHIFT;
+	max_shifted_weight = (mesh_time_constant << ARITH_SHIFT) * V1_WEIGHT;
 }

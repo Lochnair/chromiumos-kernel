@@ -17,7 +17,7 @@
 #ifndef _DRM_SYNC_HELPER_H_
 #define _DRM_SYNC_HELPER_H_
 
-#include <linux/fence.h>
+#include <linux/dma-fence.h>
 #include <linux/reservation.h>
 #include <linux/atomic.h>
 #include <linux/workqueue.h>
@@ -27,7 +27,7 @@
  * @context: execution context
  * @seqno: the sequence number of this fence inside the execution context
  */
-struct fence *drm_sw_fence_new(unsigned int context,
+struct dma_fence *drm_sw_fence_new(unsigned int context,
 			unsigned seqno);
 
 /**
@@ -37,11 +37,11 @@ struct fence *drm_sw_fence_new(unsigned int context,
  * Utility function called when owner access to object associated with fence is
  * finished (e.g. GPU done with rendering).
  */
-static inline void drm_fence_signal_and_put(struct fence **fence)
+static inline void drm_fence_signal_and_put(struct dma_fence **fence)
 {
 	if (*fence) {
-		fence_signal(*fence);
-		fence_put(*fence);
+		dma_fence_signal(*fence);
+		dma_fence_put(*fence);
 		*fence = NULL;
 	}
 }
@@ -49,9 +49,9 @@ static inline void drm_fence_signal_and_put(struct fence **fence)
 struct drm_reservation_cb;
 
 struct drm_reservation_fence_cb {
-	struct fence_cb base;
+	struct dma_fence_cb base;
 	struct drm_reservation_cb *parent;
-	struct fence *fence;
+	struct dma_fence *fence;
 };
 
 /**

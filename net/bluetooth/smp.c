@@ -2174,6 +2174,14 @@ static bool smp_ltk_encrypt(struct l2cap_conn *conn, u8 sec_level)
 	if (test_and_set_bit(HCI_CONN_ENCRYPT_PEND, &hcon->flags))
 		return true;
 
+	if (is_ltk_blocked(key, hcon->hdev)) {
+		// The peer device provided a blocked LTK. We don't want to use
+		// this LTK to start encryption, so return here but don't
+		// return false as it would be interpreted as "device not yet
+		// paired" and trigger re-pairing.
+		return true;
+	}
+
 	hci_le_start_enc(hcon, key->ediv, key->rand, key->val, key->enc_size);
 	hcon->enc_key_size = key->enc_size;
 
@@ -2484,6 +2492,19 @@ static int smp_cmd_ident_addr_info(struct l2cap_conn *conn,
 	if (!bacmp(&info->bdaddr, BDADDR_ANY) ||
 	    !hci_is_identity_address(&info->bdaddr, info->addr_type)) {
 		BT_ERR("Ignoring IRK with no identity address");
+		goto distribute;
+	}
+
+	/* Drop IRK if peer is using identity address during pairing but is
+	 * providing different address as identity information.
+	 *
+	 * Microsoft Surface Precision Mouse is known to have this bug.
+	 */
+	if (hci_is_identity_address(&hcon->dst, hcon->dst_type) &&
+	    (bacmp(&info->bdaddr, &hcon->dst) ||
+	     info->addr_type != hcon->dst_type)) {
+		bt_dev_err(hcon->hdev,
+			   "ignoring IRK with invalid identity address");
 		goto distribute;
 	}
 

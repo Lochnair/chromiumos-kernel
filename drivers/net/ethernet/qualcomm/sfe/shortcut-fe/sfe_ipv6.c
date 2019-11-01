@@ -1536,6 +1536,10 @@ static int sfe_ipv6_recv_tcp(struct sfe_ipv6 *si, struct sk_buff *skb, struct ne
 	 */
 	cm = sfe_ipv6_find_connection_match(si, dev, IPPROTO_TCP, src_ip, src_port, dest_ip, dest_port);
 	if (unlikely(!cm)) {
+		if (IS_ENABLED(CONFIG_NET_SCH_ARL) && (flags & TCP_FLAG_ACK))
+			arl_latency_sample_ingress_v6(skb,
+						      (struct ipv6hdr *)iph,
+						      (struct tcphdr *)tcph);
 		/*
 		 * We didn't get a connection but as TCP is connection-oriented that
 		 * may be because this is a non-fast connection (not running established).
@@ -1793,6 +1797,10 @@ static int sfe_ipv6_recv_tcp(struct sfe_ipv6 *si, struct sk_buff *skb, struct ne
 			counter_cm->protocol_state.tcp.max_end = max_end;
 		}
 	}
+
+	if (IS_ENABLED(CONFIG_NET_SCH_ARL) && (flags & TCP_FLAG_ACK))
+		arl_latency_sample_ingress_v6(skb, (struct ipv6hdr *)iph,
+					      (struct tcphdr *)tcph);
 
 	/*
 	 * From this point on we're good to modify the packet.
@@ -2436,11 +2444,11 @@ int sfe_ipv6_create_rule(struct sfe_connection_create *sic)
 	original_cm->counter_match = reply_cm;
 	original_cm->flags = 0;
 	if (sic->flags & SFE_CREATE_FLAG_REMARK_PRIORITY) {
-		original_cm->priority = sic->src_priority;
+		original_cm->priority = sic->priority;
 		original_cm->flags |= SFE_IPV6_CONNECTION_MATCH_FLAG_PRIORITY_REMARK;
 	}
 	if (sic->flags & SFE_CREATE_FLAG_REMARK_DSCP) {
-		original_cm->dscp = sic->src_dscp << SFE_IPV6_DSCP_SHIFT;
+		original_cm->dscp = sic->dscp << SFE_IPV6_DSCP_SHIFT;
 		original_cm->flags |= SFE_IPV6_CONNECTION_MATCH_FLAG_DSCP_REMARK;
 	}
 #ifdef CONFIG_XFRM
@@ -2492,11 +2500,11 @@ int sfe_ipv6_create_rule(struct sfe_connection_create *sic)
 	reply_cm->counter_match = original_cm;
 	reply_cm->flags = 0;
 	if (sic->flags & SFE_CREATE_FLAG_REMARK_PRIORITY) {
-		reply_cm->priority = sic->dest_priority;
+		reply_cm->priority = sic->priority;
 		reply_cm->flags |= SFE_IPV6_CONNECTION_MATCH_FLAG_PRIORITY_REMARK;
 	}
 	if (sic->flags & SFE_CREATE_FLAG_REMARK_DSCP) {
-		reply_cm->dscp = sic->dest_dscp << SFE_IPV6_DSCP_SHIFT;
+		reply_cm->dscp = sic->dscp << SFE_IPV6_DSCP_SHIFT;
 		reply_cm->flags |= SFE_IPV6_CONNECTION_MATCH_FLAG_DSCP_REMARK;
 	}
 #ifdef CONFIG_XFRM

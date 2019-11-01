@@ -111,6 +111,8 @@
 #include <asm/mce.h>
 #include <asm/alternative.h>
 #include <asm/prom.h>
+#include <asm/kaiser.h>
+#include <asm/microcode.h>
 
 /*
  * max_low_pfn_mapped: highest direct mapped pfn under 4GB
@@ -1029,6 +1031,12 @@ void __init setup_arch(char **cmdline_p)
 	 */
 	init_hypervisor_platform();
 
+	/*
+	 * This needs to happen right after XENPV is set on xen and
+	 * kaiser_enabled is checked below in cleanup_highmap().
+	 */
+	kaiser_check_boottime_disable();
+
 	x86_init.resources.probe_roms();
 
 	/* after parse_early_param, so could debug it */
@@ -1179,7 +1187,7 @@ void __init setup_arch(char **cmdline_p)
 
 	if (boot_cpu_data.cpuid_level >= 0) {
 		/* A CPU has %cr4 if and only if it has CPUID */
-		mmu_cr4_features = read_cr4();
+		mmu_cr4_features = __read_cr4();
 		if (trampoline_cr4_features)
 			*trampoline_cr4_features = mmu_cr4_features;
 	}

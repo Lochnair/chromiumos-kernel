@@ -21,7 +21,7 @@
 #include <asm/kvm_emulate.h>
 #include <asm/kvm_coproc.h>
 #include <asm/kvm_mmu.h>
-#include <asm/kvm_psci.h>
+#include <kvm/arm_psci.h>
 #include <trace/events/kvm.h>
 
 #include "trace.h"
@@ -43,7 +43,7 @@ static int handle_hvc(struct kvm_vcpu *vcpu, struct kvm_run *run)
 	trace_kvm_hvc(*vcpu_pc(vcpu), *vcpu_reg(vcpu, 0),
 		      kvm_vcpu_hvc_get_imm(vcpu));
 
-	ret = kvm_psci_call(vcpu);
+	ret = kvm_hvc_call_handler(vcpu);
 	if (ret < 0) {
 		kvm_inject_undefined(vcpu);
 		return 1;
@@ -87,18 +87,32 @@ static int handle_dabt_hyp(struct kvm_vcpu *vcpu, struct kvm_run *run)
  */
 static int kvm_handle_wfx(struct kvm_vcpu *vcpu, struct kvm_run *run)
 {
-	trace_kvm_wfi(*vcpu_pc(vcpu));
-	if (kvm_vcpu_get_hsr(vcpu) & HSR_WFI_IS_WFE)
+	if (kvm_vcpu_get_hsr(vcpu) & HSR_WFI_IS_WFE) {
+		trace_kvm_wfx(*vcpu_pc(vcpu), true);
 		kvm_vcpu_on_spin(vcpu);
-	else
+	} else {
+		trace_kvm_wfx(*vcpu_pc(vcpu), false);
 		kvm_vcpu_block(vcpu);
+	}
 
 	kvm_skip_instr(vcpu, kvm_vcpu_trap_il_is32bit(vcpu));
 
 	return 1;
 }
 
+static int kvm_handle_unknown_ec(struct kvm_vcpu *vcpu, struct kvm_run *run)
+{
+	u32 hsr = kvm_vcpu_get_hsr(vcpu);
+
+	kvm_pr_unimpl("Unknown exception class: hsr: %#08x\n",
+		      hsr);
+
+	kvm_inject_undefined(vcpu);
+	return 1;
+}
+
 static exit_handle_fn arm_exit_handlers[] = {
+	[0 ... HSR_EC_MAX]	= kvm_handle_unknown_ec,
 	[HSR_EC_WFI]		= kvm_handle_wfx,
 	[HSR_EC_CP15_32]	= kvm_handle_cp15_32,
 	[HSR_EC_CP15_64]	= kvm_handle_cp15_64,
@@ -119,13 +133,6 @@ static exit_handle_fn arm_exit_handlers[] = {
 static exit_handle_fn kvm_get_exit_handler(struct kvm_vcpu *vcpu)
 {
 	u8 hsr_ec = kvm_vcpu_trap_get_class(vcpu);
-
-	if (hsr_ec >= ARRAY_SIZE(arm_exit_handlers) ||
-	    !arm_exit_handlers[hsr_ec]) {
-		kvm_err("Unknown exception class: hsr: %#08x\n",
-			(unsigned int)kvm_vcpu_get_hsr(vcpu));
-		BUG();
-	}
 
 	return arm_exit_handlers[hsr_ec];
 }

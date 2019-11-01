@@ -46,7 +46,7 @@ struct vmw_fence_manager {
 	bool goal_irq_on; /* Protected by @goal_irq_mutex */
 	bool seqno_valid; /* Protected by @lock, and may not be set to true
 			     without the @goal_irq_mutex held. */
-	unsigned ctx;
+	u64 ctx;
 };
 
 struct vmw_user_fence {
@@ -109,7 +109,7 @@ fman_from_fence(struct vmw_fence_obj *fence)
  * objects with actions attached to them.
  */
 
-static void vmw_fence_obj_destroy(struct fence *f)
+static void vmw_fence_obj_destroy(struct dma_fence *f)
 {
 	struct vmw_fence_obj *fence =
 		container_of(f, struct vmw_fence_obj, base);
@@ -142,7 +142,7 @@ static void vmw_fence_ping_func(struct work_struct *work)
 	vmw_fifo_ping_host(fman->dev_priv, SVGA_SYNC_GENERIC);
 }
 
-static bool vmw_fence_enable_signaling(struct fence *f)
+static bool vmw_fence_enable_signaling(struct dma_fence *f)
 {
 	struct vmw_fence_obj *fence =
 		container_of(f, struct vmw_fence_obj, base);
@@ -165,12 +165,12 @@ static bool vmw_fence_enable_signaling(struct fence *f)
 }
 
 struct vmwgfx_wait_cb {
-	struct fence_cb base;
+	struct dma_fence_cb base;
 	struct task_struct *task;
 };
 
 static void
-vmwgfx_wait_cb(struct fence *fence, struct fence_cb *cb)
+vmwgfx_wait_cb(struct dma_fence *fence, struct fence_cb *cb)
 {
 	struct vmwgfx_wait_cb *wait =
 		container_of(cb, struct vmwgfx_wait_cb, base);
@@ -180,7 +180,7 @@ vmwgfx_wait_cb(struct fence *fence, struct fence_cb *cb)
 
 static void __vmw_fences_update(struct vmw_fence_manager *fman);
 
-static long vmw_fence_wait(struct fence *f, bool intr, signed long timeout)
+static long vmw_fence_wait(struct dma_fence *f, bool intr, signed long timeout)
 {
 	struct vmw_fence_obj *fence =
 		container_of(f, struct vmw_fence_obj, base);
@@ -210,7 +210,7 @@ static long vmw_fence_wait(struct fence *f, bool intr, signed long timeout)
 
 	while (ret > 0) {
 		__vmw_fences_update(fman);
-		if (test_bit(FENCE_FLAG_SIGNALED_BIT, &f->flags))
+		if (test_bit(DMA_FENCE_FLAG_SIGNALED_BIT, &f->flags))
 			break;
 
 		if (intr)
@@ -238,7 +238,7 @@ out:
 	return ret;
 }
 
-static struct fence_ops vmw_fence_ops = {
+static struct dma_fence_ops vmw_fence_ops = {
 	.get_driver_name = vmw_fence_get_driver_name,
 	.get_timeline_name = vmw_fence_get_timeline_name,
 	.enable_signaling = vmw_fence_enable_signaling,
@@ -312,7 +312,7 @@ struct vmw_fence_manager *vmw_fence_manager_init(struct vmw_private *dev_priv)
 	fman->event_fence_action_size =
 		ttm_round_pot(sizeof(struct vmw_event_fence_action));
 	mutex_init(&fman->goal_irq_mutex);
-	fman->ctx = fence_context_alloc(1);
+	fman->ctx = dma_fence_context_alloc(1);
 
 	return fman;
 }
@@ -341,8 +341,8 @@ static int vmw_fence_obj_init(struct vmw_fence_manager *fman,
 	unsigned long irq_flags;
 	int ret = 0;
 
-	fence_init(&fence->base, &vmw_fence_ops, &fman->lock,
-		   fman->ctx, seqno);
+	dma_fence_init(&fence->base, &vmw_fence_ops, &fman->lock,
+		       fman->ctx, seqno);
 	INIT_LIST_HEAD(&fence->seq_passed_actions);
 	fence->destroy = destroy;
 
@@ -446,7 +446,7 @@ static bool vmw_fence_goal_check_locked(struct vmw_fence_obj *fence)
 	u32 goal_seqno;
 	__le32 __iomem *fifo_mem;
 
-	if (fence_is_signaled_locked(&fence->base))
+	if (dma_fence_is_signaled_locked(&fence->base))
 		return false;
 
 	fifo_mem = fman->dev_priv->mmio_virt;
@@ -474,7 +474,7 @@ rerun:
 	list_for_each_entry_safe(fence, next_fence, &fman->fence_list, head) {
 		if (seqno - fence->base.seqno < VMW_FENCE_WRAP) {
 			list_del_init(&fence->head);
-			fence_signal_locked(&fence->base);
+			dma_fence_signal_locked(&fence->base);
 			INIT_LIST_HEAD(&action_list);
 			list_splice_init(&fence->seq_passed_actions,
 					 &action_list);
@@ -515,7 +515,7 @@ bool vmw_fence_obj_signaled(struct vmw_fence_obj *fence)
 {
 	struct vmw_fence_manager *fman = fman_from_fence(fence);
 
-	if (test_bit(FENCE_FLAG_SIGNALED_BIT, &fence->base.flags))
+	if (test_bit(DMA_FENCE_FLAG_SIGNALED_BIT, &fence->base.flags))
 		return 1;
 
 	vmw_fences_update(fman);
@@ -526,7 +526,7 @@ bool vmw_fence_obj_signaled(struct vmw_fence_obj *fence)
 int vmw_fence_obj_wait(struct vmw_fence_obj *fence, bool lazy,
 		       bool interruptible, unsigned long timeout)
 {
-	long ret = fence_wait_timeout(&fence->base, interruptible, timeout);
+	long ret = dma_fence_wait_timeout(&fence->base, interruptible, timeout);
 
 	if (likely(ret > 0))
 		return 0;
@@ -547,7 +547,7 @@ static void vmw_fence_destroy(struct vmw_fence_obj *fence)
 {
 	struct vmw_fence_manager *fman = fman_from_fence(fence);
 
-	fence_free(&fence->base);
+	dma_fence_free(&fence->base);
 
 	/*
 	 * Free kernel space accounting.
@@ -702,7 +702,7 @@ void vmw_fence_fifo_down(struct vmw_fence_manager *fman)
 		struct vmw_fence_obj *fence =
 			list_entry(fman->fence_list.prev, struct vmw_fence_obj,
 				   head);
-		fence_get(&fence->base);
+		dma_fence_get(&fence->base);
 		spin_unlock_irq(&fman->lock);
 
 		ret = vmw_fence_obj_wait(fence, false, false,
@@ -710,7 +710,7 @@ void vmw_fence_fifo_down(struct vmw_fence_manager *fman)
 
 		if (unlikely(ret != 0)) {
 			list_del_init(&fence->head);
-			fence_signal(&fence->base);
+			dma_fence_signal(&fence->base);
 			INIT_LIST_HEAD(&action_list);
 			list_splice_init(&fence->seq_passed_actions,
 					 &action_list);
@@ -718,7 +718,7 @@ void vmw_fence_fifo_down(struct vmw_fence_manager *fman)
 		}
 
 		BUG_ON(!list_empty(&fence->head));
-		fence_put(&fence->base);
+		dma_fence_put(&fence->base);
 		spin_lock_irq(&fman->lock);
 	}
 	spin_unlock_irq(&fman->lock);
@@ -912,9 +912,8 @@ static void vmw_event_fence_action_seq_passed(struct vmw_fence_action *action)
 	}
 
 	list_del_init(&eaction->fpriv_head);
-	list_add_tail(&eaction->event->link, &file_priv->event_list);
 	eaction->event = NULL;
-	wake_up_all(&file_priv->event_wait);
+	drm_send_event_locked(dev, eaction->event);
 	spin_unlock_irqrestore(&dev->event_lock, irq_flags);
 }
 
@@ -963,7 +962,7 @@ static void vmw_fence_obj_add_action(struct vmw_fence_obj *fence,
 	spin_lock_irqsave(&fman->lock, irq_flags);
 
 	fman->pending_actions[action->type]++;
-	if (fence_is_signaled_locked(&fence->base)) {
+	if (dma_fence_is_signaled_locked(&fence->base)) {
 		struct list_head action_list;
 
 		INIT_LIST_HEAD(&action_list);

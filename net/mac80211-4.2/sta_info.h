@@ -329,6 +329,25 @@ struct mesh_sta {
 	u32 bitrate_avg;
 };
 
+/* To collect multicast broadcast stats */
+struct mc_bc_stats {
+	u64 mc_pkts;
+	u64 mc_bytes;
+	u64 bc_pkts;
+	u64 bc_bytes;
+};
+
+struct rx_rate_limit {
+	/* token count */
+	s64 tokens;
+	/* The burst limit in ns */
+	s64 burst_size;
+	/* last RX timestamp */
+	u64 t_c;
+	/* The receive rate limit */
+	u32 rate;
+};
+
 /**
  * struct sta_info - STA information
  *
@@ -490,6 +509,8 @@ struct sta_info {
 	/* Updated from TX path only, no locking requirements */
 	u64 tx_packets[IEEE80211_NUM_ACS];
 	u64 tx_bytes[IEEE80211_NUM_ACS];
+	struct mc_bc_stats mc_bc_stat;
+	struct rx_rate_limit mc_rx_limit, bc_rx_limit;
 	struct ieee80211_tx_rate last_tx_rate;
 	int last_rx_rate_idx;
 	u32 last_rx_rate_flag;
@@ -546,6 +567,7 @@ struct sta_info {
 
 	struct cfg80211_chan_def tdls_chandef;
 
+	struct ewma ave_data_rssi;
 	/* keep last! */
 	struct ieee80211_sta sta;
 };
@@ -719,6 +741,9 @@ void sta_set_sinfo(struct sta_info *sta, struct station_info *sinfo);
 void ieee80211_sta_expire(struct ieee80211_sub_if_data *sdata,
 			  unsigned long exp_time);
 u8 sta_info_tx_streams(struct sta_info *sta);
+
+/* Calculates the bc/mc receive frame burst size */
+void mc_bc_burst_size(struct sta_info *sta);
 
 void ieee80211_sta_ps_deliver_wakeup(struct sta_info *sta);
 void ieee80211_sta_ps_deliver_poll_response(struct sta_info *sta);

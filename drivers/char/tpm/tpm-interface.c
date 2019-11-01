@@ -388,6 +388,9 @@ ssize_t tpm_transmit(struct tpm_chip *chip, const char *buf,
 
 	mutex_lock(&chip->tpm_mutex);
 
+	if (chip->ops->clk_enable != NULL)
+		chip->ops->clk_enable(chip, true);
+
 	rc = chip->ops->send(chip, (u8 *) buf, count);
 	if (rc < 0) {
 		dev_err(chip->pdev,
@@ -429,6 +432,9 @@ out_recv:
 		dev_err(chip->pdev,
 			"tpm_transmit: tpm_recv: error %zd\n", rc);
 out:
+	if (chip->ops->clk_enable != NULL)
+		chip->ops->clk_enable(chip, false);
+
 	mutex_unlock(&chip->tpm_mutex);
 	return rc;
 }

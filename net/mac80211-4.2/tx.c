@@ -1337,11 +1337,13 @@ static struct sk_buff *fq_tin_dequeue_func(struct fq *fq,
 	struct codel_vars *cvars;
 	struct codel_params *cparams;
 	struct codel_stats *cstats;
+	int tid;
 
 	local = container_of(fq, struct ieee80211_local, fq);
 	txqi = container_of(tin, struct txq_info, tin);
-	cparams = &local->cparams;
-	cstats = &local->cstats;
+	tid = txqi->txq.tid;
+	cparams = &local->cparams[tid];
+	cstats = &txqi->cstats;
 
 	if (flow == &txqi->def_flow)
 		cvars = &txqi->def_cvars;
@@ -1401,6 +1403,7 @@ void ieee80211_txq_init(struct ieee80211_sub_if_data *sdata,
 	fq_tin_init(&txqi->tin);
 	fq_flow_init(&txqi->def_flow);
 	codel_vars_init(&txqi->def_cvars);
+	codel_stats_init(&txqi->cstats);
 
 	txqi->txq.vif = &sdata->vif;
 
@@ -1438,11 +1441,12 @@ int ieee80211_txq_setup_flows(struct ieee80211_local *local)
 	if (ret)
 		return ret;
 
-	codel_params_init(&local->cparams);
-	codel_stats_init(&local->cstats);
-	local->cparams.interval = MS2TIME(100);
-	local->cparams.target = MS2TIME(20);
-	local->cparams.ecn = true;
+	for (i = 0; i < IEEE80211_NUM_TIDS; i++) {
+		codel_params_init(&local->cparams[i]);
+		local->cparams[i].interval = MS2TIME(100);
+		local->cparams[i].target = MS2TIME(20);
+		local->cparams[i].ecn = true;
+	}
 
 	local->cvars = kcalloc(fq->flows_cnt, sizeof(local->cvars[0]),
 			       GFP_KERNEL);
@@ -2519,7 +2523,7 @@ static struct sk_buff *ieee80211_build_hdr(struct ieee80211_sub_if_data *sdata,
 		     !multicast && !authorized &&
 		     (cpu_to_be16(ethertype) != sdata->control_port_protocol ||
 		      !ether_addr_equal(sdata->vif.addr, skb->data + ETH_ALEN)))) {
-#ifdef CONFIG_MAC80211_VERBOSE_DEBUG
+#if defined(CONFIG_MAC80211_VERBOSE_DEBUG) && defined(ENABLE_DROP_FRAME_LOG)
 		net_info_ratelimited("%s: dropped frame to %pM (unauthorized port)\n",
 				    sdata->name, hdr.addr1);
 #endif

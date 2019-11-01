@@ -1122,6 +1122,21 @@ static void ieee80211_mesh_rx_bcn_presp(struct ieee80211_sub_if_data *sdata,
 	size_t baselen;
 	int freq;
 	enum ieee80211_band band = rx_status->band;
+	struct sta_info  *sta;
+
+	/* Check if the PEER was connected and added in the STA list. (Because
+	 * the rssi_threshold should be checked only with the NEW PEER trying
+	 * to form the link. If the PEER entry doesn't exist in the STA list,
+	 * then compare the rssi_threshold value with the signal strength of
+	 * the received BEACON/PRESP frames).
+	 */
+	if (sdata->u.mesh.user_mpm && ifmsh->mshcfg.rssi_threshold) {
+		sta = sta_info_get(sdata, mgmt->sa);
+		if (!sta) {
+			if (rx_status->signal <= ifmsh->mshcfg.rssi_threshold)
+				return;
+		}
+	}
 
 	/* ignore ProbeResp to foreign address */
 	if (stype == IEEE80211_STYPE_PROBE_RESP &&

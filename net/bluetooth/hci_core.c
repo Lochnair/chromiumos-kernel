@@ -34,6 +34,7 @@
 
 #include <net/bluetooth/bluetooth.h>
 #include <net/bluetooth/hci_core.h>
+#include <net/bluetooth/hci_le_splitter.h>
 #include <net/bluetooth/l2cap.h>
 #include <net/bluetooth/mgmt.h>
 
@@ -1269,6 +1270,79 @@ done:
 	return err;
 }
 
+static int hci_set_err_data_report_req(struct hci_request *req,
+				       unsigned long opt)
+{
+	struct hci_dev *hdev = req->hdev;
+	struct hci_cp_write_err_data_report cp;
+
+	if (!hdev->wide_band_speech)
+		return -EOPNOTSUPP;
+
+	/* Write Default Erroneous Data Reporting */
+	cp.enable = true;
+	hci_req_add(req, HCI_OP_WRITE_ERR_DATA_REPORT, sizeof(cp), &cp);
+	return 0;
+}
+
+static void hci_set_err_data_report(struct hci_dev *hdev)
+{
+	int err;
+
+	if (!hdev->wide_band_speech) {
+		BT_DBG("wide_band_speech is not supported.");
+		return;
+	}
+
+	/* Enable Erroneous Data Reporting */
+	err = __hci_req_sync(hdev, hci_set_err_data_report_req, 0,
+			     HCI_CMD_TIMEOUT, NULL);
+	if (err) {
+		BT_ERR("HCI_OP_WRITE_ERR_DATA_REPORT failed");
+		hdev->wide_band_speech = false;
+	}
+	BT_DBG("wide_band_speech: %d", hdev->wide_band_speech);
+}
+
+/* TODO(crbug.com/977059): create a blacklist of controllers from other
+ * vendors in addition to Intel that do not support wide-band speech.
+ */
+static const struct controller_id_t blacklist_wide_band_speech[] = {
+	/* Intel Stone Peak 2 (AC7265) */
+	{ CONTROLLER_ID(0x8087, 0x0a2a) },
+
+	/* Intel Wilkins Peak 2 (AC7260) */
+	{ CONTROLLER_ID(0x8087, 0x07dc) },
+
+	/* Terminating entry -- add entries above this line -- */
+	{ }
+};
+
+static void check_wide_band_speech_capability(struct hci_dev *hdev)
+{
+	const struct controller_id_t *id = blacklist_wide_band_speech;
+
+	if (hdev->controller_id.idVendor != 0x8087)
+		goto not_supported;
+
+	for (; id->idVendor || id->idProduct; id++) {
+		if (hdev->controller_id.idVendor == id->idVendor &&
+		    hdev->controller_id.idProduct == id->idProduct) {
+			BT_DBG("controller id (0x%4.4xk, 0x%4.4x) in blacklist",
+			       hdev->controller_id.idVendor,
+			       hdev->controller_id.idProduct);
+			goto not_supported;
+		}
+	}
+
+	hdev->wide_band_speech = true;
+	hci_set_err_data_report(hdev);
+	return;
+
+not_supported:
+	hdev->wide_band_speech = false;
+}
+
 static int hci_dev_do_open(struct hci_dev *hdev)
 {
 	int ret = 0;
@@ -1322,6 +1396,8 @@ static int hci_dev_do_open(struct hci_dev *hdev)
 		ret = -EIO;
 		goto done;
 	}
+
+	hci_le_splitter_init_start(hdev);
 
 	set_bit(HCI_RUNNING, &hdev->flags);
 	hci_sock_dev_event(hdev, HCI_DEV_OPEN);
@@ -1389,12 +1465,29 @@ static int hci_dev_do_open(struct hci_dev *hdev)
 
 	clear_bit(HCI_INIT, &hdev->flags);
 
+#ifdef CONFIG_BT_ENFORCE_CLASSIC_SECURITY
+	/* Don't allow usage of Bluetooth if the chip doesn't support */
+	/* Read Encryption Key Size command (byte 20 bit 4). */
+	if (!ret && !(hdev->commands[20] & 0x10)) {
+		WARN(1, "Disabling Bluetooth due to unsupported HCI Read Encryption Key Size command");
+		ret = -EIO;
+	}
+#endif
+
+	if (!ret)
+		ret = hci_le_splitter_init_done(hdev);
+
 	if (!ret) {
+
 		hci_dev_hold(hdev);
 		hci_dev_set_flag(hdev, HCI_RPA_EXPIRED);
 		set_bit(HCI_UP, &hdev->flags);
 		hci_sock_dev_event(hdev, HCI_DEV_UP);
 		hci_leds_update_powered(hdev, true);
+
+		/* Check wide band speech capability before power on. */
+		check_wide_band_speech_capability(hdev);
+
 		if (!hci_dev_test_flag(hdev, HCI_SETUP) &&
 		    !hci_dev_test_flag(hdev, HCI_CONFIG) &&
 		    !hci_dev_test_flag(hdev, HCI_UNCONFIGURED) &&
@@ -1405,6 +1498,8 @@ static int hci_dev_do_open(struct hci_dev *hdev)
 			mgmt_power_on(hdev, ret);
 		}
 	} else {
+		hci_le_splitter_init_fail(hdev);
+
 		/* Init failed, cleanup */
 		flush_work(&hdev->tx_work);
 		flush_work(&hdev->cmd_work);
@@ -1513,6 +1608,8 @@ int hci_dev_do_close(struct hci_dev *hdev)
 
 	BT_DBG("%s %p", hdev->name, hdev);
 
+	hci_le_splitter_deinit(hdev);
+
 	if (!hci_dev_test_flag(hdev, HCI_UNREGISTER) &&
 	    !hci_dev_test_flag(hdev, HCI_USER_CHANNEL) &&
 	    test_bit(HCI_UP, &hdev->flags)) {
@@ -1556,6 +1653,14 @@ int hci_dev_do_close(struct hci_dev *hdev)
 	drain_workqueue(hdev->workqueue);
 
 	hci_dev_lock(hdev);
+
+	/* This will clear the HCI_LE_SCAN_CHANGE_IN_PROGRESS flag in case its
+	 * already set and exception occurred to sync host and controller state.
+	 */
+	if (hci_dev_test_flag(hdev, HCI_LE_SCAN_CHANGE_IN_PROGRESS)) {
+		hci_dev_clear_flag(hdev, HCI_LE_SCAN_CHANGE_IN_PROGRESS);
+		hdev->count_scan_change_in_progress = 0;
+	}
 
 	hci_discovery_set_state(hdev, DISCOVERY_STOPPED);
 
@@ -2966,6 +3071,9 @@ struct hci_dev *hci_alloc_dev(void)
 	hdev->le_max_rx_len = 0x001b;
 	hdev->le_max_rx_time = 0x0148;
 
+	hdev->count_adv_change_in_progress = 0;
+	hdev->count_scan_change_in_progress = 0;
+
 	hdev->rpa_timeout = HCI_DEFAULT_RPA_TIMEOUT;
 	hdev->discov_interleaved_timeout = DISCOV_INTERLEAVED_TIMEOUT;
 	hdev->conn_info_min_age = DEFAULT_CONN_INFO_MIN_AGE;
@@ -3113,6 +3221,10 @@ int hci_register_dev(struct hci_dev *hdev)
 
 	hci_sock_dev_event(hdev, HCI_DEV_REG);
 	hci_dev_hold(hdev);
+
+	// Don't try to power on if LE splitter is not yet set up.
+	if (hci_le_splitter_get_enabled_state() == SPLITTER_STATE_NOT_SET)
+		return id;
 
 	queue_work(hdev->req_workqueue, &hdev->power_on);
 
@@ -3344,6 +3456,11 @@ static void hci_send_frame(struct hci_dev *hdev, struct sk_buff *skb)
 	skb_orphan(skb);
 
 	if (!test_bit(HCI_RUNNING, &hdev->flags)) {
+		kfree_skb(skb);
+		return;
+	}
+
+	if (!hci_le_splitter_should_allow_bluez_tx(hdev, skb)) {
 		kfree_skb(skb);
 		return;
 	}
@@ -4177,6 +4294,9 @@ static void hci_rx_work(struct work_struct *work)
 			continue;
 		}
 
+		if (!hci_le_splitter_should_allow_bluez_rx(hdev, skb))
+			continue;
+
 		if (test_bit(HCI_INIT, &hdev->flags)) {
 			/* Don't process data packets in this states. */
 			switch (hci_skb_pkt_type(skb)) {
@@ -4211,13 +4331,104 @@ static void hci_rx_work(struct work_struct *work)
 	}
 }
 
+/* This is a conditional HCI command. The HCI command
+ * would be executed only when the run-time condition
+ * is met.
+ */
+static bool skip_conditional_cmd(struct work_struct *work, struct sk_buff *skb)
+{
+	struct hci_dev *hdev = container_of(work, struct hci_dev, cmd_work);
+	bool cur_enabled, cur_changing, desired_enabled, conditional_cmd = false;
+	unsigned bit_num_cur_ena, bit_num_cur_chng;
+	bool ret = false;
+
+	hci_dev_lock(hdev);
+
+	if (hci_skb_pkt_type(skb) == HCI_COMMAND_PKT) {
+		if (hci_skb_opcode(skb) == HCI_OP_LE_SET_ADV_ENABLE) {
+			desired_enabled = !!*(skb_tail_pointer(skb) - 1);
+			bit_num_cur_ena = HCI_LE_ADV;
+			bit_num_cur_chng = HCI_LE_ADV_CHANGE_IN_PROGRESS;
+			conditional_cmd = true;
+		} else if (hci_skb_opcode(skb) == HCI_OP_LE_SET_SCAN_ENABLE) {
+			desired_enabled = !!*(skb_tail_pointer(skb) - 2);
+			bit_num_cur_ena = HCI_LE_SCAN;
+			bit_num_cur_chng = HCI_LE_SCAN_CHANGE_IN_PROGRESS;
+			conditional_cmd = true;
+			BT_DBG("BT_DBG_DG: set scan enable tx: desired=%d\n",
+			       desired_enabled);
+		}
+	}
+
+	if (conditional_cmd) {
+
+		cur_enabled = hci_dev_test_flag(hdev, bit_num_cur_ena);
+		cur_changing = hci_dev_test_flag(hdev, bit_num_cur_chng);
+
+		BT_DBG("COND opcode=0x%04x, wanted=%d, on=%d, chngn=%d",
+		       hci_skb_opcode(skb), desired_enabled, cur_enabled,
+		       cur_changing);
+
+		/* No need to enable/disable anything if it is already in that
+		 * state or about to be.
+		 * The following condition is good for at most 1 pending
+		 * enabled command and 1 pending disabled command.
+		 * Refer to crbug.com/781749 for more context.
+		 */
+		if ((cur_enabled == desired_enabled && !cur_changing) ||
+		    (cur_enabled != desired_enabled && cur_changing)) {
+			BT_DBG("  COND LE cmd (0x%04x) is already %d (chg %d),"
+				" skip transition to %d", hci_skb_opcode(skb),
+				cur_enabled, cur_changing, desired_enabled);
+
+			skb_orphan(skb);
+			kfree_skb(skb);
+
+			/* See if there are more commands to do in cmd_q. */
+			atomic_set(&hdev->cmd_cnt, 1);
+			if (!skb_queue_empty(&hdev->cmd_q)) {
+				BT_DBG("  COND call queue_work.");
+				queue_work(hdev->workqueue, &hdev->cmd_work);
+			} else {
+				BT_DBG("  COND no more cmd in queue.");
+			}
+			ret = true;
+			goto out;
+		}
+
+		hci_dev_set_flag(hdev, bit_num_cur_chng);
+		if (bit_num_cur_chng == HCI_LE_ADV_CHANGE_IN_PROGRESS) {
+			hdev->count_adv_change_in_progress++;
+			if (hdev->count_adv_change_in_progress <= 0 ||
+			    hdev->count_adv_change_in_progress >= 3)
+				BT_WARN("Unexpected "
+					"count_adv_change_in_progress: %d",
+					hdev->count_adv_change_in_progress);
+			else
+				BT_DBG("count_adv_change_in_progress: %d",
+				       hdev->count_adv_change_in_progress);
+		} else if (bit_num_cur_chng == HCI_LE_SCAN_CHANGE_IN_PROGRESS) {
+			hdev->count_scan_change_in_progress++;
+			if (hdev->count_scan_change_in_progress <= 0 ||
+			    hdev->count_scan_change_in_progress >= 3)
+				BT_WARN("Unexpected "
+					"count_scan_change_in_progress: %d",
+					hdev->count_scan_change_in_progress);
+			else
+				BT_DBG("count_scan_change_in_progress: %d",
+				       hdev->count_scan_change_in_progress);
+		}
+	}
+
+out:
+	hci_dev_unlock(hdev);
+	return ret;
+}
+
 static void hci_cmd_work(struct work_struct *work)
 {
 	struct hci_dev *hdev = container_of(work, struct hci_dev, cmd_work);
 	struct sk_buff *skb;
-
-	BT_DBG("%s cmd_cnt %d cmd queued %d", hdev->name,
-	       atomic_read(&hdev->cmd_cnt), skb_queue_len(&hdev->cmd_q));
 
 	/* Send queued commands */
 	if (atomic_read(&hdev->cmd_cnt)) {
@@ -4230,6 +4441,11 @@ static void hci_cmd_work(struct work_struct *work)
 		hdev->sent_cmd = skb_clone(skb, GFP_KERNEL);
 		if (hdev->sent_cmd) {
 			atomic_dec(&hdev->cmd_cnt);
+
+			/* Check if the command could be skipped. */
+			if (skip_conditional_cmd(work, skb))
+				return;
+
 			hci_send_frame(hdev, skb);
 			if (test_bit(HCI_RESET, &hdev->flags))
 				cancel_delayed_work(&hdev->cmd_timer);
@@ -4241,4 +4457,16 @@ static void hci_cmd_work(struct work_struct *work)
 			queue_work(hdev->workqueue, &hdev->cmd_work);
 		}
 	}
+}
+
+bool is_ltk_blocked(struct smp_ltk *ltk, struct hci_dev *hdev)
+{
+	int i;
+
+	for (i = 0; i < MAX_BLOCKED_LTKS; i++) {
+		if (!memcmp(ltk->val, hdev->blocked_ltks[i], LTK_LENGTH))
+			return true;
+	}
+
+	return false;
 }

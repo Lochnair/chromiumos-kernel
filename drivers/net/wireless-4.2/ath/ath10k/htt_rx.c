@@ -25,7 +25,7 @@
 #ifdef CONFIG_ATH10K_SMART_ANTENNA
 #include "smart_ant.h"
 #endif
-
+#include "spectral.h"
 #include <linux/log2.h>
 
 #define HTT_RX_RING_SIZE HTT_RX_RING_SIZE_MAX
@@ -2030,7 +2030,6 @@ static void ath10k_htt_rx_tx_fetch_ind(struct ath10k *ar, struct sk_buff *skb)
 	u8 tid;
 	int ret;
 	int i;
-	bool refill = false;
 
 	ath10k_dbg(ar, ATH10K_DBG_HTT, "htt rx tx fetch ind\n");
 
@@ -2067,6 +2066,9 @@ static void ath10k_htt_rx_tx_fetch_ind(struct ath10k *ar, struct sk_buff *skb)
 
 	rcu_read_lock();
 
+	spin_lock_bh(&ar->txqs_lock);
+	ath10k_atf_refill_deficit(ar);
+	spin_unlock_bh(&ar->txqs_lock);
 	for (i = 0; i < num_records; i++) {
 		struct ath10k_txq *artxq;
 		record = &resp->tx_fetch_ind.records[i];
@@ -2114,10 +2116,8 @@ static void ath10k_htt_rx_tx_fetch_ind(struct ath10k *ar, struct sk_buff *skb)
 			num_bytes += ret;
 
 			if (ath10k_atf_scheduler_enabled(ar) &&
-			    (artxq->atf.deficit < 0)) {
-				refill = true;
+			    (artxq->atf.deficit < 0))
 				break;
-			}
 		}
 		trace_ath10k_htt_rx_tx_fetch_ind(ar, i, peer_id, max_num_msdus,
 						 max_num_bytes, num_msdus,
@@ -2129,11 +2129,6 @@ static void ath10k_htt_rx_tx_fetch_ind(struct ath10k *ar, struct sk_buff *skb)
 		ath10k_htt_tx_txq_recalc(hw, txq);
 	}
 
-	if (refill) {
-		spin_lock_bh(&ar->txqs_lock);
-		ath10k_atf_refill_deficit(ar);
-		spin_unlock_bh(&ar->txqs_lock);
-	}
 	rcu_read_unlock();
 
 	resp_ids = ath10k_htt_get_tx_fetch_ind_resp_ids(&resp->tx_fetch_ind);
@@ -2426,6 +2421,155 @@ err:
 	ath10k_warn(ar, "invalid per peer stats received\n");
 }
 
+static void
+ath10k_htt_fetch_n_relay_cfr_data(struct ath10k *ar,
+				  struct htt_peer_cfr_dump_ind_lagacy *htt_msg,
+				  struct ath10k_rfs_cfr_dump *rfs_cfr_dump)
+{
+	struct ath10k_mem_chunk *mem_chunk = NULL;
+	u32 mem_index = __le32_to_cpu(htt_msg->index);
+	u32 req_id = MS(htt_msg->info, HTT_T2H_CFR_DUMP_TYPE1_MEM_REQ_ID);
+	u32 *rindex, *windex;
+	u32 msg_len = __le32_to_cpu(htt_msg->length);
+	void *vaddr;
+	int i;
+
+	/* Find host allocated memory for the request ID provied by firmware,
+	 * in HTT message, where CFR dump is wrriten by the firmware.
+	 *
+	 *  Host allocated memory layout:
+	 *     Read      Write                                     FW
+	 *    Index      Index   <-------   CFR data     ------->Magic Num
+	 *  --------------------------------------------------------------
+	 *  | 4 byte  | 4 byte   |      CFR dump                | 4 byte |
+	 *  --------------------------------------------------------------
+	 *    Updated   Updated                                  Updated
+	 *      by      by FW                                     by FW
+	 *     host
+	 **/
+	for (i = 0 ; i < ar->wmi.num_mem_chunks; i++) {
+		if (ar->wmi.mem_chunks[i].req_id == req_id)
+			mem_chunk = &ar->wmi.mem_chunks[i];
+	}
+
+	if (mem_chunk == NULL) {
+		ath10k_warn(ar, "No memory allocated for req ID %d\n", req_id);
+		return;
+	}
+
+	/* fetch the read index and write index pointers based on above memory
+	 * logic.
+	 **/
+	vaddr = mem_chunk->vaddr;
+	rindex = (u32 *)vaddr;
+	windex = rindex + 1;
+
+
+	/* mem_index is having the index of the address where CFR dump wrriten,
+	 * find data pointer from mem index and start address of memory.
+	 **/
+	rfs_cfr_dump->cfr_dump = vaddr + mem_index;
+	/*Dont do relayfs when there is no data to realy*/
+	if (msg_len)
+		ath10k_cfr_dump_to_rfs(ar, rfs_cfr_dump->cfr_dump, msg_len);
+
+	/* Updating the read index to the number of bytes read by host, it will
+	 * help in writing next capture.
+	 * ignoring 4 byte for FW magic number from the actual allocated memory
+	 * length to avoid courruption in magic number. This memory is circular
+	 * so after complation of one round, Skipping the first 8 byte as they
+	 * are for read index and write index.
+	 */
+	if (((*rindex) + msg_len) <= (mem_chunk->len - 4))
+		(*rindex) += msg_len;
+	else if (((*rindex) + msg_len) > (mem_chunk->len - 4))
+		(*rindex) = (msg_len + 8);
+}
+
+static void
+ath10k_htt_populate_rfs_cfr_header(struct ath10k *ar,
+				   struct ath10k_rfs_cfr_hdr *cfr_hdr,
+				   struct htt_peer_cfr_dump_ind_lagacy *cfr_ind)
+{
+	u8 rx_chain_mask;
+
+	cfr_hdr->head_magic_num = 0xDEADBEAF;
+	ether_addr_copy(cfr_hdr->addr, cfr_ind->mac_addr.addr);
+	cfr_hdr->status = MS(cfr_ind->info, HTT_T2H_CFR_DUMP_TYPE1_STATUS);
+	cfr_hdr->capture_bw = MS(cfr_ind->info, HTT_T2H_CFR_DUMP_TYPE1_CAP_BW);
+	cfr_hdr->channel_bw = MS(cfr_ind->info, HTT_T2H_CFR_DUMP_TYPE1_CHAN_BW);
+	cfr_hdr->capture_mode = MS(cfr_ind->info, HTT_T2H_CFR_DUMP_TYPE1_MODE);
+	cfr_hdr->capture_type = MS(cfr_ind->info, HTT_T2H_CFR_DUMP_TYPE1_CAP_TYPE);
+	cfr_hdr->sts_count = MS(cfr_ind->info, HTT_T2H_CFR_DUMP_TYPE1_STS);
+
+	cfr_hdr->prim20_chan = __le32_to_cpu(cfr_ind->chan_mhz);
+	cfr_hdr->center_freq1 =  __le32_to_cpu(cfr_ind->center_freq1);
+	cfr_hdr->center_freq2 =  __le32_to_cpu(cfr_ind->center_freq2);
+	cfr_hdr->phy_mode = __le32_to_cpu(cfr_ind->chan_phy_mode);
+
+	rx_chain_mask = ar->cfg_rx_chainmask;
+
+	while (rx_chain_mask) {
+		if (rx_chain_mask & BIT(0))
+			cfr_hdr->num_rx_chain++;
+
+		rx_chain_mask >>= 1;
+	}
+
+	cfr_hdr->length = __le32_to_cpu(cfr_ind->length);
+
+	cfr_hdr->timestamp = __le32_to_cpu(cfr_ind->timestamp);
+
+	ath10k_cfr_dump_to_rfs(ar , cfr_hdr, sizeof(struct ath10k_rfs_cfr_hdr));
+}
+
+static void ath10k_htt_peer_cfr_compl_ind(struct ath10k *ar,
+					  struct sk_buff *skb)
+{
+	struct htt_resp *resp = (struct htt_resp *)skb->data;
+	struct ath10k_rfs_cfr_dump rfs_cfr_dump = { };
+	enum htt_cfr_capture_msg_type cfr_msg_type;
+	int expected_len;
+
+	cfr_msg_type = __le32_to_cpu(resp->cfr_dump_ind.cfr_msg_type);
+
+	switch (cfr_msg_type) {
+	case HTT_PEER_CFR_CAPTURE_MSG_TYPE_LAGACY:
+		if (!test_bit(WMI_SERVICE_CFR_CAPTURE_IND_MSG_TYPE_LAGACY,
+			      ar->wmi.svc_map)) {
+			ath10k_warn(ar, "Un supported msg type\n");
+			return;
+		}
+
+		expected_len = sizeof(struct htt_resp_hdr) +
+			       sizeof(struct htt_peer_cfr_dump_ind_lagacy) +
+			       sizeof(u32) + (3*sizeof(u8));
+		if (skb->len < expected_len) {
+			ath10k_warn(ar, "Invalid cfr capture completion event %d\n",
+				    skb->len);
+			return;
+		}
+
+		ath10k_htt_populate_rfs_cfr_header(ar, &rfs_cfr_dump.cfr_hdr,
+						   &resp->cfr_dump_ind.cfr_dump_lagacy);
+
+		ath10k_htt_fetch_n_relay_cfr_data(ar,
+						  &resp->cfr_dump_ind.cfr_dump_lagacy,
+						  &rfs_cfr_dump);
+
+		rfs_cfr_dump.tail_magic_num = 0xBEAFDEAD;
+
+		ath10k_cfr_dump_to_rfs(ar , &rfs_cfr_dump.tail_magic_num,
+				       sizeof(u32));
+
+		ath10k_cfr_finlalize_relay(ar);
+		break;
+	default:
+		ath10k_warn(ar, "unsupported CFR capture method\n");
+		break;
+	}
+}
+
 static void ath10k_fetch_10_2_tx_stats(struct ath10k *ar, u8 *data)
 {
 	struct ath10k_pktlog_hdr *hdr = (struct ath10k_pktlog_hdr *)data;
@@ -2683,6 +2827,10 @@ void ath10k_htt_t2h_msg_handler(struct ath10k *ar, struct sk_buff *skb)
 	case HTT_T2H_MSG_TYPE_PEER_STATS:
 		if (ath10k_peer_stats_enabled(ar))
 			ath10k_htt_fetch_10_4_peer_stats(ar, skb);
+		break;
+	case HTT_T2H_MSG_TYPE_CFR_DUMP_COMPL_IND:
+		if (ath10k_peer_cfr_capture_enabled(ar))
+			ath10k_htt_peer_cfr_compl_ind(ar, skb);
 		break;
 	case HTT_T2H_MSG_TYPE_EN_STATS:
 		ath10k_smart_ant_10_4_proc_tx_feedback(ar, skb);

@@ -7,6 +7,7 @@
 #include <linux/workqueue.h>
 #include <linux/netfilter/nf_conntrack_tcp.h>
 #include <linux/seqlock.h>
+#include <linux/notifier.h>
 
 struct ctl_table_header;
 struct nf_conntrack_ecache;
@@ -77,6 +78,7 @@ struct netns_ct {
 #ifdef CONFIG_NF_CONNTRACK_EVENTS
 	struct delayed_work ecache_dwork;
 	bool ecache_dwork_pending;
+	struct notifier_block ctnetlink_notifier;
 #endif
 #ifdef CONFIG_SYSCTL
 	struct ctl_table_header	*sysctl_header;

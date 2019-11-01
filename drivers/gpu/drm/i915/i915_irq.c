@@ -2788,6 +2788,26 @@ semaphore_waits_for(struct intel_engine_cs *ring, u32 *seqno)
 	u64 offset = 0;
 	int i, backwards;
 
+	/*
+	 * This function does not support execlist mode - any attempt to
+	 * proceed further into this function will result in a kernel panic
+	 * when dereferencing ring->buffer, which is not set up in execlist
+	 * mode.
+	 *
+	 * The correct way of doing it would be to derive the currently
+	 * executing ring buffer from the current context, which is derived
+	 * from the currently running request. Unfortunately, to get the
+	 * current request we would have to grab the struct_mutex before doing
+	 * anything else, which would be ill-advised since some other thread
+	 * might have grabbed it already and managed to hang itself, causing
+	 * the hang checker to deadlock.
+	 *
+	 * Therefore, this function does not support execlist mode in its
+	 * current form. Just return NULL and move on.
+	 */
+	if (ring->buffer == NULL)
+		return NULL;
+
 	ipehr = I915_READ(RING_IPEHR(ring->mmio_base));
 	if (!ipehr_is_semaphore_wait(ring->dev, ipehr))
 		return NULL;
@@ -2867,14 +2887,44 @@ static void semaphore_clear_deadlocks(struct drm_i915_private *dev_priv)
 		ring->hangcheck.deadlock = 0;
 }
 
-static enum intel_ring_hangcheck_action
-ring_stuck(struct intel_engine_cs *ring, u64 acthd)
+static bool subunits_stuck(struct intel_engine_cs *ring)
 {
-	struct drm_device *dev = ring->dev;
-	struct drm_i915_private *dev_priv = dev->dev_private;
-	u32 tmp;
+	u32 instdone[I915_NUM_INSTDONE_REG];
+	bool stuck;
+	int i;
 
+	if (ring->id != RCS)
+		return true;
+
+	i915_get_extra_instdone(ring->dev, instdone);
+
+	/* There might be unstable subunit states even when
+	 * actual head is not moving. Filter out the unstable ones by
+	 * accumulating the undone -> done transitions and only
+	 * consider those as progress.
+	 */
+	stuck = true;
+	for (i = 0; i < I915_NUM_INSTDONE_REG; i++) {
+		const u32 tmp = instdone[i] | ring->hangcheck.instdone[i];
+
+		if (tmp != ring->hangcheck.instdone[i])
+			stuck = false;
+
+		ring->hangcheck.instdone[i] |= tmp;
+	}
+
+	return stuck;
+}
+
+static enum intel_ring_hangcheck_action
+head_stuck(struct intel_engine_cs *ring, u64 acthd)
+{
 	if (acthd != ring->hangcheck.acthd) {
+
+		/* Clear subunit states on head movement */
+		memset(ring->hangcheck.instdone, 0,
+		       sizeof(ring->hangcheck.instdone));
+
 		if (acthd > ring->hangcheck.max_acthd) {
 			ring->hangcheck.max_acthd = acthd;
 			return HANGCHECK_ACTIVE;
@@ -2882,6 +2932,24 @@ ring_stuck(struct intel_engine_cs *ring, u64 acthd)
 
 		return HANGCHECK_ACTIVE_LOOP;
 	}
+
+	if (!subunits_stuck(ring))
+		return HANGCHECK_ACTIVE;
+
+	return HANGCHECK_HUNG;
+}
+
+static enum intel_ring_hangcheck_action
+ring_stuck(struct intel_engine_cs *ring, u64 acthd)
+{
+	struct drm_device *dev = ring->dev;
+	struct drm_i915_private *dev_priv = dev->dev_private;
+	enum intel_ring_hangcheck_action ha;
+	u32 tmp;
+
+	ha = head_stuck(ring, acthd);
+	if (ha != HANGCHECK_HUNG)
+		return ha;
 
 	if (IS_GEN2(dev))
 		return HANGCHECK_HUNG;
@@ -3024,7 +3092,11 @@ static void i915_hangcheck_elapsed(struct work_struct *work)
 			if (ring->hangcheck.score > 0)
 				ring->hangcheck.score--;
 
+			/* Clear head and subunit states on seqno movement */
 			ring->hangcheck.acthd = ring->hangcheck.max_acthd = 0;
+
+			memset(ring->hangcheck.instdone, 0,
+			       sizeof(ring->hangcheck.instdone));
 		}
 
 		ring->hangcheck.seqno = seqno;

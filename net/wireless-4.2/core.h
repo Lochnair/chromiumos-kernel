@@ -440,6 +440,8 @@ unsigned int
 cfg80211_chandef_dfs_cac_time(struct wiphy *wiphy,
 			      const struct cfg80211_chan_def *chandef);
 
+void cfg80211_sched_dfs_chan_update(struct cfg80211_registered_device *rdev);
+
 static inline unsigned int elapsed_jiffies_msecs(unsigned long start)
 {
 	unsigned long end = jiffies;

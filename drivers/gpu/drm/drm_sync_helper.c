@@ -96,7 +96,7 @@ void drm_unlock_reservations(struct reservation_object **resvs,
 }
 EXPORT_SYMBOL(drm_unlock_reservations);
 
-static void reservation_cb_fence_cb(struct fence *fence, struct fence_cb *cb)
+static void reservation_cb_fence_cb(struct dma_fence *fence, struct dma_fence_cb *cb)
 {
 	struct drm_reservation_fence_cb *rfcb =
 		container_of(cb, struct drm_reservation_fence_cb, base);
@@ -113,9 +113,9 @@ reservation_cb_cleanup(struct drm_reservation_cb *rcb)
 
 	for (cb = 0; cb < rcb->num_fence_cbs; cb++) {
 		if (rcb->fence_cbs[cb]) {
-			fence_remove_callback(rcb->fence_cbs[cb]->fence,
-						&rcb->fence_cbs[cb]->base);
-			fence_put(rcb->fence_cbs[cb]->fence);
+			dma_fence_remove_callback(rcb->fence_cbs[cb]->fence,
+						  &rcb->fence_cbs[cb]->base);
+			dma_fence_put(rcb->fence_cbs[cb]->fence);
 			kfree(rcb->fence_cbs[cb]);
 			rcb->fence_cbs[cb] = NULL;
 		}
@@ -138,7 +138,7 @@ static void reservation_cb_work(struct work_struct *pwork)
 }
 
 static int
-reservation_cb_add_fence_cb(struct drm_reservation_cb *rcb, struct fence *fence)
+reservation_cb_add_fence_cb(struct drm_reservation_cb *rcb, struct dma_fence *fence)
 {
 	int ret = 0;
 	struct drm_reservation_fence_cb *fence_cb;
@@ -160,22 +160,22 @@ reservation_cb_add_fence_cb(struct drm_reservation_cb *rcb, struct fence *fence)
 	 * do not want for fence to disappear on us while we are waiting for
 	 * callback and we need it in case we want to remove callbacks
 	 */
-	fence_get(fence);
+	dma_fence_get(fence);
 	fence_cb->fence = fence;
 	fence_cb->parent = rcb;
 	rcb->fence_cbs[rcb->num_fence_cbs] = fence_cb;
 	atomic_inc(&rcb->count);
-	ret = fence_add_callback(fence, &fence_cb->base,
+	ret = dma_fence_add_callback(fence, &fence_cb->base,
 					reservation_cb_fence_cb);
 	if (ret == -ENOENT) {
 		/* already signaled */
 		atomic_dec(&rcb->count);
-		fence_put(fence_cb->fence);
+		dma_fence_put(fence_cb->fence);
 		kfree(fence_cb);
 		ret = 0;
 	} else if (ret < 0) {
 		atomic_dec(&rcb->count);
-		fence_put(fence_cb->fence);
+		dma_fence_put(fence_cb->fence);
 		kfree(fence_cb);
 		return ret;
 	} else {
@@ -202,9 +202,9 @@ drm_reservation_cb_add(struct drm_reservation_cb *rcb,
 			struct reservation_object *resv, bool exclusive)
 {
 	int ret = 0;
-	struct fence *fence;
+	struct dma_fence *fence;
 	unsigned shared_count = 0, f;
-	struct fence **shared_fences = NULL;
+	struct dma_fence **shared_fences = NULL;
 
 	/* enum all the fences in the reservation and add callbacks */
 	ret = reservation_object_get_fences_rcu(resv, &fence,
@@ -233,10 +233,10 @@ drm_reservation_cb_add(struct drm_reservation_cb *rcb,
 
 error:
 	if (fence)
-		fence_put(fence);
+		dma_fence_put(fence);
 	if (shared_fences) {
 		for (f = 0; f < shared_count; f++)
-			fence_put(shared_fences[f]);
+			dma_fence_put(shared_fences[f]);
 		kfree(shared_fences);
 	}
 	return ret;
@@ -273,41 +273,41 @@ drm_reservation_cb_fini(struct drm_reservation_cb *rcb)
 }
 EXPORT_SYMBOL(drm_reservation_cb_fini);
 
-static bool sw_fence_enable_signaling(struct fence *f)
+static bool sw_fence_enable_signaling(struct dma_fence *f)
 {
 	return true;
 }
 
-static const char *sw_fence_get_get_driver_name(struct fence *fence)
+static const char *sw_fence_get_get_driver_name(struct dma_fence *fence)
 {
 	return "drm_sync_helper";
 }
 
-static const char *sw_fence_get_timeline_name(struct fence *f)
+static const char *sw_fence_get_timeline_name(struct dma_fence *f)
 {
 	return "drm_sync.sw";
 }
 
-static const struct fence_ops sw_fence_ops = {
+static const struct dma_fence_ops sw_fence_ops = {
 	.get_driver_name = sw_fence_get_get_driver_name,
 	.get_timeline_name = sw_fence_get_timeline_name,
 	.enable_signaling = sw_fence_enable_signaling,
 	.signaled = NULL,
-	.wait = fence_default_wait,
+	.wait = dma_fence_default_wait,
 	.release = NULL
 };
 
-struct fence *drm_sw_fence_new(unsigned int context, unsigned seqno)
+struct dma_fence *drm_sw_fence_new(unsigned int context, unsigned seqno)
 {
-	struct fence *fence;
+	struct dma_fence *fence;
 
 	fence = kzalloc(sizeof(*fence), GFP_KERNEL);
 	if (!fence)
 		return ERR_PTR(-ENOMEM);
-	fence_init(fence,
-		   &sw_fence_ops,
-		   &sw_fence_lock,
-		   context, seqno);
+	dma_fence_init(fence,
+		       &sw_fence_ops,
+		       &sw_fence_lock,
+		       context, seqno);
 
 	return fence;
 }

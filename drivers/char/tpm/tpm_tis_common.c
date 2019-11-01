@@ -103,6 +103,57 @@ void tpm_tis_ready(struct tpm_chip *chip)
 }
 EXPORT_SYMBOL(tpm_tis_ready);
 
+/**
+ * tpm_tis_clkrun_enable() - Keep clkrun protocol disabled for entire duration
+ *			     of a single TPM command
+ * @chip:	TPM chip to use
+ * @value:	1 - Disable CLKRUN protocol, so that clocks are free running
+ *		0 - Enable CLKRUN protocol
+ */
+void tpm_tis_clkrun_enable(struct tpm_chip *chip, bool value)
+{
+	struct priv_data *priv = chip->vendor.priv;
+	u32 clkrun_val;
+
+	if (!IS_ENABLED(CONFIG_X86) || !is_bsw() || !priv->ilb_base_addr)
+		return;
+
+	if (value) {
+		priv->clk_enabled++;
+		if (priv->clk_enabled > 1)
+			return;
+
+		clkrun_val = ioread32(priv->ilb_base_addr + LPC_CNTRL_OFFSET);
+
+		/* Disable LPC CLKRUN# */
+		clkrun_val &= ~LPC_CLKRUN_EN;
+		iowrite32(clkrun_val, priv->ilb_base_addr + LPC_CNTRL_OFFSET);
+
+		/*
+		 * Write any random value on port 0x80 which is on LPC, to make
+		 * sure LPC clock is running before sending any TPM command.
+		 */
+		outb(0xCC, 0x80);
+	} else {
+		priv->clk_enabled--;
+		if (priv->clk_enabled)
+			return;
+
+		clkrun_val = ioread32(priv->ilb_base_addr + LPC_CNTRL_OFFSET);
+
+		/* Enable LPC CLKRUN# */
+		clkrun_val |= LPC_CLKRUN_EN;
+		iowrite32(clkrun_val, priv->ilb_base_addr + LPC_CNTRL_OFFSET);
+
+		/*
+		 * Write any random value on port 0x80 which is on LPC, to make
+		 * sure LPC clock is running before sending any TPM command.
+		 */
+		outb(0xCC, 0x80);
+	}
+}
+EXPORT_SYMBOL(tpm_tis_clkrun_enable);
+
 static int get_burstcount(struct tpm_chip *chip)
 {
 	unsigned long stop;
@@ -325,8 +376,11 @@ EXPORT_SYMBOL(tpm_tis_send);
 
 bool tpm_tis_update_timeouts(struct tpm_chip *chip, unsigned long *timeout_cap)
 {
-	int i;
+	int i, rc;
 	u32 did_vid;
+
+	if (chip->ops->clk_enable != NULL)
+		chip->ops->clk_enable(chip, true);
 
 	read_tpm_dword(chip, TPM_DID_VID(0), &did_vid);
 
@@ -335,10 +389,17 @@ bool tpm_tis_update_timeouts(struct tpm_chip *chip, unsigned long *timeout_cap)
 			continue;
 		memcpy(timeout_cap, vendor_timeout_overrides[i].timeout_us,
 		       sizeof(vendor_timeout_overrides[i].timeout_us));
-		return true;
+		rc = true;
+		goto out;
 	}
 
-	return false;
+	rc = false;
+	goto out;
+
+out:
+	if (chip->ops->clk_enable != NULL)
+		chip->ops->clk_enable(chip, false);
+	return rc;
 }
 EXPORT_SYMBOL(tpm_tis_update_timeouts);
 
@@ -405,6 +466,9 @@ static irqreturn_t tis_int_handler(int dummy, void *dev_id)
 void tpm_tis_remove(struct tpm_chip *chip)
 {
 	u32 interrupt;
+	struct priv_data *priv = chip->vendor.priv;
+
+	tpm_tis_clkrun_enable(chip, true);
 
 	if (chip->flags & TPM_CHIP_FLAG_TPM2)
 		tpm2_shutdown(chip, TPM2_SU_CLEAR);
@@ -414,6 +478,11 @@ void tpm_tis_remove(struct tpm_chip *chip)
 
 	write_tpm_dword(chip, TPM_INT_ENABLE(chip->vendor.locality), interrupt);
 	release_locality(chip, chip->vendor.locality, 1);
+
+	tpm_tis_clkrun_enable(chip, false);
+
+	if (priv->ilb_base_addr)
+		iounmap(priv->ilb_base_addr);
 }
 EXPORT_SYMBOL(tpm_tis_remove);
 
@@ -421,6 +490,9 @@ EXPORT_SYMBOL(tpm_tis_remove);
 static void tpm_tis_reenable_interrupts(struct tpm_chip *chip)
 {
 	u32 intmask;
+
+	if (chip->ops->clk_enable != NULL)
+		chip->ops->clk_enable(chip, true);
 
 	/* reenable interrupts that device may have lost or
 	   BIOS/firmware may have disabled */
@@ -433,6 +505,9 @@ static void tpm_tis_reenable_interrupts(struct tpm_chip *chip)
 	    | TPM_INTF_STS_VALID_INT | TPM_GLOBAL_INT_ENABLE;
 
 	write_tpm_dword(chip, TPM_INT_ENABLE(chip->vendor.locality), intmask);
+
+	if (chip->ops->clk_enable != NULL)
+		chip->ops->clk_enable(chip, false);
 }
 
 int tpm_tis_resume(struct device *dev)
@@ -516,6 +591,9 @@ int tpm_tis_init_generic(struct device *dev, struct tpm_chip *chip, unsigned int
 	chip->vendor.timeout_b = TIS_TIMEOUT_B_MAX;
 	chip->vendor.timeout_c = TIS_TIMEOUT_C_MAX;
 	chip->vendor.timeout_d = TIS_TIMEOUT_D_MAX;
+
+	if (chip->ops->clk_enable != NULL)
+		chip->ops->clk_enable(chip, true);
 
 	if (wait_startup(chip, 0) != 0) {
 		rc = -ENODEV;
@@ -690,8 +768,19 @@ int tpm_tis_init_generic(struct device *dev, struct tpm_chip *chip, unsigned int
 			dev_err(dev, "TPM self test failed - ignoring\n");
 	}
 
-	return tpm_chip_register(chip);
+	rc = tpm_chip_register(chip);
+
+	if (rc)
+		goto out_err;
+
+	if (chip->ops->clk_enable != NULL)
+		chip->ops->clk_enable(chip, false);
+
+	return 0;
 out_err:
+	if ((chip->ops != NULL) && (chip->ops->clk_enable != NULL))
+		chip->ops->clk_enable(chip, false);
+
 	tpm_tis_remove(chip);
 	return rc;
 }

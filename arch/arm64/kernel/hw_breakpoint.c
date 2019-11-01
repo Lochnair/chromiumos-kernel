@@ -36,6 +36,7 @@
 #include <asm/traps.h>
 #include <asm/cputype.h>
 #include <asm/system_misc.h>
+#include <asm/uaccess.h>
 
 /* Breakpoint currently in use for each BRP. */
 static DEFINE_PER_CPU(struct perf_event *, bp_on_reg[ARM_MAX_BRP]);
@@ -49,18 +50,6 @@ static DEFINE_PER_CPU(int, stepping_kernel_bp);
 /* Number of BRP/WRP registers on this CPU. */
 static int core_num_brps;
 static int core_num_wrps;
-
-/* Determine number of BRP registers available. */
-static int get_num_brps(void)
-{
-	return ((read_cpuid(ID_AA64DFR0_EL1) >> 12) & 0xf) + 1;
-}
-
-/* Determine number of WRP registers available. */
-static int get_num_wrps(void)
-{
-	return ((read_cpuid(ID_AA64DFR0_EL1) >> 20) & 0xf) + 1;
-}
 
 int hw_breakpoint_slots(int type)
 {
@@ -689,7 +678,7 @@ static int watchpoint_handler(unsigned long addr, unsigned int esr,
 
 		/* Check if the watchpoint value matches. */
 		val = read_wb_reg(AARCH64_DBG_REG_WVR, i);
-		if (val != (addr & ~alignment_mask))
+		if (val != (untagged_addr(addr) & ~alignment_mask))
 			goto unlock;
 
 		/* Possible match, check the byte address select to confirm. */

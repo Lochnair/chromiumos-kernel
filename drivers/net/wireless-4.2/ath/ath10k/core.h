@@ -196,6 +196,27 @@ struct ath10k_fw_stats_vdev {
 	u32 beacon_rssi_history[10];
 };
 
+struct ath10k_fw_stats_vdev_extd {
+	struct list_head list;
+
+	u32 vdev_id;
+	u32 ppdu_aggr_cnt;
+	u32 ppdu_noack;
+	u32 mpdu_queued;
+	u32 ppdu_nonaggr_cnt;
+	u32 mpdu_sw_requeued;
+	u32 mpdu_suc_retry;
+	u32 mpdu_suc_multitry;
+	u32 mpdu_fail_retry;
+	u32 tx_ftm_suc;
+	u32 tx_ftm_suc_retry;
+	u32 tx_ftm_fail;
+	u32 rx_ftmr_cnt;
+	u32 rx_ftmr_dup_cnt;
+	u32 rx_iftmr_cnt;
+	u32 rx_iftmr_dup_cnt;
+};
+
 struct ath10k_fw_stats_pdev {
 	struct list_head list;
 
@@ -410,6 +431,13 @@ struct ath10k_txq {
 	struct atf_scheduler atf;
 };
 
+struct ath10k_cfr_capture {
+	u32 cfr_enable;
+	u32 cfr_period;
+	u32 cfr_bandwidth;
+	u32 cfr_method;
+};
+
 struct ath10k_sta {
 	struct ath10k_vif *arvif;
 
@@ -430,9 +458,12 @@ struct ath10k_sta {
 #endif
 
 	u8 tpc;
+	u8 ampdu_subframe_count;
 	u32 peer_ps_state;
 
 	struct ath10k_smart_ant_sta *smart_ant_sta;
+	struct ath10k_cfr_capture cfr_capture;
+	bool pspoll_sta_ko_enable;
 };
 
 #define ATH10K_VDEV_SETUP_TIMEOUT_HZ (5*HZ)
@@ -515,14 +546,19 @@ struct ath10k_fw_crash_data {
 	__le32 registers[REG_DUMP_COUNT_QCA988X];
 };
 
-#define ATH10K_DELAY_STATS_MAX_BIN	100
+#define ATH10K_TX_DELAY_STATS_MAX_BIN 20
 struct ath10k_tx_delay_stats {
-	/* histogram of tx delay with 101 bins. The bucket size scales
-	 * linearly, from 10ms to 1000ms. Each bin is a counter of tx
-	 * packets with delay in that range.
+	/* histogram of tx delay with 21 bins. The bucket size scales
+	 * exponentially, from 1ms to 1024ms. Each power-of-two bucket that
+	 * spans greater than 1ms is subdivided into two bins (e.g. the range
+	 * [2, 4) is broken into bins [2, 3) and [3, 4), while the range
+	 * [32, 64) is broken into bins [32, 48) and [48, 64), etc.).
+	 * Each bin is a counter of tx packet with delay in that range.
 	 */
-	u32 counts[ATH10K_DELAY_STATS_MAX_BIN + 1];
+	u32 counts[ATH10K_TX_DELAY_STATS_MAX_BIN + 1];
 };
+
+#define ATH10K_FTMR_MAX_NUM_VDEVS 20
 
 struct ath10k_debug {
 	struct dentry *debugfs_phy;
@@ -549,10 +585,11 @@ struct ath10k_debug {
 	u32 reg_addr;
 	u32 nf_cal_period;
 	u32 wlan_traffic_priority;
+	int ftmr_enabled[ATH10K_FTMR_MAX_NUM_VDEVS];
 
 	struct ath10k_fw_crash_data *fw_crash_data;
 	struct dentry *debugfs_smartant;
-	struct ath10k_tx_delay_stats *tx_delay_stats[IEEE80211_NUM_ACS];
+	struct ath10k_tx_delay_stats *tx_delay_stats[IEEE80211_NUM_TIDS];
 };
 
 enum ath10k_state {
@@ -1095,6 +1132,15 @@ struct ath10k {
 	u32	atf_release_limit;
 	u32	atf_bytes_send;
 	u32	atf_bytes_send_last_interval;
+	u32	atf_max_num_pending_tx;
+	u32	atf_txq_limit_min[IEEE80211_NUM_TIDS];
+	u32	atf_txq_limit_max[IEEE80211_NUM_TIDS];
+	u32	atf_quantum[IEEE80211_NUM_TIDS];
+	u32	atf_quantum_mesh[IEEE80211_NUM_TIDS];
+	u32	cfr_enable;
+	struct rchan *rfs_cfr_capture;
+
+	u32 burst_dur[4];
 	/* must be last */
 	u8 drv_priv[0] __aligned(sizeof(void *));
 };
@@ -1102,6 +1148,14 @@ struct ath10k {
 static inline bool ath10k_atf_scheduler_enabled(struct ath10k *ar)
 {
 	return ar->atf_enabled;
+}
+
+static inline bool ath10k_peer_cfr_capture_enabled(struct ath10k *ar)
+{
+	if (test_bit(WMI_SERVICE_CFR_CAPTURE_SUPPORT, ar->wmi.svc_map))
+		return true;
+
+	return false;
 }
 
 static inline bool ath10k_peer_stats_enabled(struct ath10k *ar)

@@ -5503,44 +5503,25 @@ skl_dpll0_disable(struct drm_i915_private *dev_priv)
 	dev_priv->cdclk_pll.vco = 0;
 }
 
-static bool skl_cdclk_pcu_ready(struct drm_i915_private *dev_priv)
-{
-	int ret;
-	u32 val;
-
-	/* inform PCU we want to change CDCLK */
-	val = SKL_CDCLK_PREPARE_FOR_CHANGE;
-	mutex_lock(&dev_priv->rps.hw_lock);
-	ret = sandybridge_pcode_read(dev_priv, SKL_PCODE_CDCLK_CONTROL, &val);
-	mutex_unlock(&dev_priv->rps.hw_lock);
-
-	return ret == 0 && (val & SKL_CDCLK_READY_FOR_CHANGE);
-}
-
-static bool skl_cdclk_wait_for_pcu_ready(struct drm_i915_private *dev_priv)
-{
-	unsigned int i;
-
-	for (i = 0; i < 15; i++) {
-		if (skl_cdclk_pcu_ready(dev_priv))
-			return true;
-		udelay(10);
-	}
-
-	return false;
-}
-
 static void skl_set_cdclk(struct drm_i915_private *dev_priv, int cdclk, int vco)
 {
 	struct drm_device *dev = dev_priv->dev;
 	u32 freq_select, pcu_ack;
+	int ret;
 
 	WARN_ON((cdclk == 24000) != (vco == 0));
 
 	DRM_DEBUG_DRIVER("Changing CDCLK to %d kHz (VCO %d kHz)\n", cdclk, vco);
 
-	if (!skl_cdclk_wait_for_pcu_ready(dev_priv)) {
-		DRM_ERROR("failed to inform PCU about cdclk change\n");
+	mutex_lock(&dev_priv->rps.hw_lock);
+	ret = skl_pcode_request(dev_priv, SKL_PCODE_CDCLK_CONTROL,
+				SKL_CDCLK_PREPARE_FOR_CHANGE,
+				SKL_CDCLK_READY_FOR_CHANGE,
+				SKL_CDCLK_READY_FOR_CHANGE, 3);
+	mutex_unlock(&dev_priv->rps.hw_lock);
+	if (ret) {
+		DRM_ERROR("Failed to inform PCU about cdclk change (%d)\n",
+			  ret);
 		return;
 	}
 
@@ -5974,6 +5955,8 @@ static void valleyview_crtc_enable(struct drm_crtc *crtc)
 
 	i9xx_set_pipeconf(intel_crtc);
 
+	intel_color_set_csc(crtc);
+
 	intel_crtc->active = true;
 
 	intel_set_cpu_fifo_underrun_reporting(dev_priv, pipe, true);
@@ -6364,7 +6347,7 @@ retry:
 	pipe_config->fdi_lanes = lane;
 
 	intel_link_compute_m_n(pipe_config->pipe_bpp, lane, fdi_dotclock,
-			       link_bw, &pipe_config->fdi_m_n);
+			       link_bw, &pipe_config->fdi_m_n, false);
 
 	ret = ironlake_check_fdi_lanes(dev, intel_crtc->pipe, pipe_config);
 	if (ret == -EINVAL && pipe_config->pipe_bpp > 6*3) {
@@ -6900,8 +6883,22 @@ intel_reduce_m_n_ratio(uint32_t *num, uint32_t *den)
 }
 
 static void compute_m_n(unsigned int m, unsigned int n,
-			uint32_t *ret_m, uint32_t *ret_n)
+			uint32_t *ret_m, uint32_t *ret_n,
+			bool reduce_m_n)
 {
+	/*
+	 * Reduce M/N as much as possible without loss in precision. Several DP
+	 * dongles in particular seem to be fussy about too large *link* M/N
+	 * values. The passed in values are more likely to have the least
+	 * significant bits zero than M after rounding below, so do this first.
+	 */
+	if (reduce_m_n) {
+		while ((m & 1) == 0 && (n & 1) == 0) {
+			m >>= 1;
+			n >>= 1;
+		}
+	}
+
 	*ret_n = min_t(unsigned int, roundup_pow_of_two(n), DATA_LINK_N_MAX);
 	*ret_m = div_u64((uint64_t) m * *ret_n, n);
 	intel_reduce_m_n_ratio(ret_m, ret_n);
@@ -6910,16 +6907,19 @@ static void compute_m_n(unsigned int m, unsigned int n,
 void
 intel_link_compute_m_n(int bits_per_pixel, int nlanes,
 		       int pixel_clock, int link_clock,
-		       struct intel_link_m_n *m_n)
+		       struct intel_link_m_n *m_n,
+		       bool reduce_m_n)
 {
 	m_n->tu = 64;
 
 	compute_m_n(bits_per_pixel * pixel_clock,
 		    link_clock * nlanes * 8,
-		    &m_n->gmch_m, &m_n->gmch_n);
+		    &m_n->gmch_m, &m_n->gmch_n,
+		    reduce_m_n);
 
 	compute_m_n(pixel_clock, link_clock,
-		    &m_n->link_m, &m_n->link_n);
+		    &m_n->link_m, &m_n->link_n,
+		    reduce_m_n);
 }
 
 static inline bool intel_panel_use_ssc(struct drm_i915_private *dev_priv)
@@ -9317,6 +9317,29 @@ static void broxton_modeset_commit_cdclk(struct drm_atomic_state *old_state)
 	broxton_set_cdclk(dev, req_cdclk);
 }
 
+static int bdw_adjust_min_pipe_pixel_rate(struct intel_crtc_state *crtc_state,
+					  int pixel_rate)
+{
+	struct drm_i915_private *dev_priv = to_i915(crtc_state->base.crtc->dev);
+
+	/* pixel rate mustn't exceed 95% of cdclk with IPS on BDW */
+	if (IS_BROADWELL(dev_priv) && crtc_state->ips_enabled)
+		pixel_rate = DIV_ROUND_UP(pixel_rate * 100, 95);
+
+	/* BSpec says "Do not use DisplayPort with CDCLK less than
+	 * 432 MHz, audio enabled, port width x4, and link rate
+	 * HBR2 (5.4 GHz), or else there may be audio corruption or
+	 * screen corruption."
+	 */
+	if (intel_crtc_has_dp_encoder(crtc_state) &&
+	    crtc_state->has_audio &&
+	    crtc_state->port_clock >= 540000 &&
+	    crtc_state->lane_count == 4)
+		pixel_rate = max(432000, pixel_rate);
+
+	return pixel_rate;
+}
+
 /* compute the max rate for new configuration */
 static int ilk_max_pixel_rate(struct drm_atomic_state *state)
 {
@@ -9342,9 +9365,9 @@ static int ilk_max_pixel_rate(struct drm_atomic_state *state)
 
 		pixel_rate = ilk_pipe_pixel_rate(crtc_state);
 
-		/* pixel rate mustn't exceed 95% of cdclk with IPS on BDW */
-		if (IS_BROADWELL(dev_priv) && crtc_state->ips_enabled)
-			pixel_rate = DIV_ROUND_UP(pixel_rate * 100, 95);
+		if (IS_BROADWELL(dev_priv) || IS_GEN9(dev_priv))
+			pixel_rate = bdw_adjust_min_pipe_pixel_rate(crtc_state,
+								    pixel_rate);
 
 		intel_state->min_pixclk[i] = pixel_rate;
 	}
@@ -16134,26 +16157,5 @@ intel_display_print_error_state(struct drm_i915_error_state_buf *m,
 		err_printf(m, "  VTOTAL: %08x\n", error->transcoder[i].vtotal);
 		err_printf(m, "  VBLANK: %08x\n", error->transcoder[i].vblank);
 		err_printf(m, "  VSYNC: %08x\n", error->transcoder[i].vsync);
-	}
-}
-
-void intel_modeset_preclose(struct drm_device *dev, struct drm_file *file)
-{
-	struct intel_crtc *crtc;
-
-	for_each_intel_crtc(dev, crtc) {
-		struct intel_unpin_work *work;
-
-		spin_lock_irq(&dev->event_lock);
-
-		work = crtc->unpin_work;
-
-		if (work && work->event &&
-		    work->event->base.file_priv == file) {
-			kfree(work->event);
-			work->event = NULL;
-		}
-
-		spin_unlock_irq(&dev->event_lock);
 	}
 }

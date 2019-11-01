@@ -170,6 +170,9 @@ static int i915_getparam(struct drm_device *dev, void *data,
 	case I915_PARAM_HAS_RESOURCE_STREAMER:
 		value = HAS_RESOURCE_STREAMER(dev);
 		break;
+	case I915_PARAM_HAS_EXEC_SOFTPIN:
+		value = 0;
+		break;
 	default:
 		DRM_DEBUG("Unknown parameter %d\n", param->param);
 		return -EINVAL;
@@ -1350,8 +1353,6 @@ void i915_driver_preclose(struct drm_device *dev, struct drm_file *file)
 	i915_gem_context_close(dev, file);
 	i915_gem_release(dev, file);
 	mutex_unlock(&dev->struct_mutex);
-
-	intel_modeset_preclose(dev, file);
 }
 
 void i915_driver_postclose(struct drm_device *dev, struct drm_file *file)

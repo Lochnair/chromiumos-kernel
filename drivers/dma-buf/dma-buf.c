@@ -25,7 +25,7 @@
 #include <linux/fs.h>
 #include <linux/slab.h>
 #include <linux/dma-buf.h>
-#include <linux/fence.h>
+#include <linux/dma-fence.h>
 #include <linux/anon_inodes.h>
 #include <linux/export.h>
 #include <linux/debugfs.h>
@@ -170,7 +170,7 @@ static loff_t dma_buf_llseek(struct file *file, loff_t offset, int whence)
 	return base + offset;
 }
 
-static void dma_buf_poll_cb(struct fence *fence, struct fence_cb *cb)
+static void dma_buf_poll_cb(struct dma_fence *fence, struct dma_fence_cb *cb)
 {
 	struct dma_buf_poll_cb_t *dcb = (struct dma_buf_poll_cb_t *)cb;
 	unsigned long flags;
@@ -186,7 +186,7 @@ static unsigned int dma_buf_poll(struct file *file, poll_table *poll)
 	struct dma_buf *dmabuf;
 	struct reservation_object *resv;
 	struct reservation_object_list *fobj;
-	struct fence *fence_excl;
+	struct dma_fence *fence_excl;
 	unsigned long events;
 	unsigned shared_count, seq;
 
@@ -233,20 +233,20 @@ retry:
 		spin_unlock_irq(&dmabuf->poll.lock);
 
 		if (events & pevents) {
-			if (!fence_get_rcu(fence_excl)) {
+			if (!dma_fence_get_rcu(fence_excl)) {
 				/* force a recheck */
 				events &= ~pevents;
 				dma_buf_poll_cb(NULL, &dcb->cb);
-			} else if (!fence_add_callback(fence_excl, &dcb->cb,
-						       dma_buf_poll_cb)) {
+			} else if (!dma_fence_add_callback(fence_excl, &dcb->cb,
+							   dma_buf_poll_cb)) {
 				events &= ~pevents;
-				fence_put(fence_excl);
+				dma_fence_put(fence_excl);
 			} else {
 				/*
 				 * No callback queued, wake up any additional
 				 * waiters.
 				 */
-				fence_put(fence_excl);
+				dma_fence_put(fence_excl);
 				dma_buf_poll_cb(NULL, &dcb->cb);
 			}
 		}
@@ -268,9 +268,9 @@ retry:
 			goto out;
 
 		for (i = 0; i < shared_count; ++i) {
-			struct fence *fence = rcu_dereference(fobj->shared[i]);
+			struct dma_fence *fence = rcu_dereference(fobj->shared[i]);
 
-			if (!fence_get_rcu(fence)) {
+			if (!dma_fence_get_rcu(fence)) {
 				/*
 				 * fence refcount dropped to zero, this means
 				 * that fobj has been freed
@@ -281,13 +281,13 @@ retry:
 				dma_buf_poll_cb(NULL, &dcb->cb);
 				break;
 			}
-			if (!fence_add_callback(fence, &dcb->cb,
-						dma_buf_poll_cb)) {
-				fence_put(fence);
+			if (!dma_fence_add_callback(fence, &dcb->cb,
+						    dma_buf_poll_cb)) {
+				dma_fence_put(fence);
 				events &= ~POLLOUT;
 				break;
 			}
-			fence_put(fence);
+			dma_fence_put(fence);
 		}
 
 		/* No callback queued, wake up any additional waiters. */
@@ -349,6 +349,9 @@ static const struct file_operations dma_buf_fops = {
 	.llseek		= dma_buf_llseek,
 	.poll		= dma_buf_poll,
 	.unlocked_ioctl	= dma_buf_ioctl,
+#ifdef CONFIG_COMPAT
+	.compat_ioctl	= dma_buf_ioctl,
+#endif
 };
 
 /*
@@ -358,6 +361,37 @@ static inline int is_dma_buf_file(struct file *file)
 {
 	return file->f_op == &dma_buf_fops;
 }
+
+/*
+ * DOC: dma buf device access
+ *
+ * For device DMA access to a shared DMA buffer the usual sequence of operations
+ * is fairly simple:
+ *
+ * 1. The exporter defines his exporter instance using
+ *    DEFINE_DMA_BUF_EXPORT_INFO() and calls dma_buf_export() to wrap a private
+ *    buffer object into a &dma_buf. It then exports that &dma_buf to userspace
+ *    as a file descriptor by calling dma_buf_fd().
+ *
+ * 2. Userspace passes this file-descriptors to all drivers it wants this buffer
+ *    to share with: First the filedescriptor is converted to a &dma_buf using
+ *    dma_buf_get(). The the buffer is attached to the device using
+ *    dma_buf_attach().
+ *
+ *    Up to this stage the exporter is still free to migrate or reallocate the
+ *    backing storage.
+ *
+ * 3. Once the buffer is attached to all devices userspace can inniate DMA
+ *    access to the shared buffer. In the kernel this is done by calling
+ *    dma_buf_map_attachment() and dma_buf_unmap_attachment().
+ *
+ * 4. Once a driver is done with a shared buffer it needs to call
+ *    dma_buf_detach() (after cleaning up any mappings) and then release the
+ *    reference acquired with dma_buf_get by calling dma_buf_put().
+ *
+ * For the detailed semantics exporters are expected to implement see
+ * &dma_buf_ops.
+ */
 
 /**
  * dma_buf_export_named - Creates a new dma_buf, and associates an anon file
@@ -376,6 +410,8 @@ static inline int is_dma_buf_file(struct file *file)
  * supplied private data and operations for dma_buf_ops. On either missing
  * ops, or error in allocating struct dma_buf, will return negative error.
  *
+ * For most cases the easiest way to create @exp_info is through the
+ * %DEFINE_DMA_BUF_EXPORT_INFO macro.
  */
 struct dma_buf *dma_buf_export_named(void *priv, const struct dma_buf_ops *ops,
 				size_t size, int flags, const char *exp_name,
@@ -493,7 +529,12 @@ EXPORT_SYMBOL_GPL(dma_buf_get);
  * dma_buf_put - decreases refcount of the buffer
  * @dmabuf:	[in]	buffer to reduce refcount of
  *
- * Uses file's refcounting done implicitly by fput()
+ * Uses file's refcounting done implicitly by fput().
+ *
+ * If, as a result of this call, the refcount becomes 0, the 'release' file
+ * operation related to this fd is called. It calls the release operation of
+ * struct &dma_buf_ops in turn, and frees the memory allocated for dmabuf when
+ * exported.
  */
 void dma_buf_put(struct dma_buf *dmabuf)
 {
@@ -510,8 +551,17 @@ EXPORT_SYMBOL_GPL(dma_buf_put);
  * @dmabuf:	[in]	buffer to attach device to.
  * @dev:	[in]	device to be attached.
  *
- * Returns struct dma_buf_attachment * for this attachment; returns ERR_PTR on
- * error.
+ * Returns struct dma_buf_attachment pointer for this attachment. Attachments
+ * must be cleaned up by calling dma_buf_detach().
+ *
+ * Returns:
+ *
+ * A pointer to newly created &dma_buf_attachment on success, or a negative
+ * error code wrapped into a pointer on failure.
+ *
+ * Note that this can fail if the backing storage of @dmabuf is in a place not
+ * accessible to @dev, and cannot be moved to a more suitable place. This is
+ * indicated with the error code -EBUSY.
  */
 struct dma_buf_attachment *dma_buf_attach(struct dma_buf *dmabuf,
 					  struct device *dev)
@@ -554,6 +604,7 @@ EXPORT_SYMBOL_GPL(dma_buf_attach);
  * @dmabuf:	[in]	buffer to detach from.
  * @attach:	[in]	attachment to be detached; is free'd after this call.
  *
+ * Clean up a device attachment obtained by calling dma_buf_attach().
  */
 void dma_buf_detach(struct dma_buf *dmabuf, struct dma_buf_attachment *attach)
 {
@@ -578,7 +629,12 @@ EXPORT_SYMBOL_GPL(dma_buf_detach);
  * @direction:	[in]	direction of DMA transfer
  *
  * Returns sg_table containing the scatterlist to be returned; returns ERR_PTR
- * on error.
+ * on error. May return -EINTR if it is interrupted by a signal.
+ *
+ * A mapping must be unmapped again using dma_buf_map_attachment(). Note that
+ * the underlying backing storage is pinned for as long as a mapping exists,
+ * therefore users/importers should not hold onto a mapping for undue amounts of
+ * time.
  */
 struct sg_table *dma_buf_map_attachment(struct dma_buf_attachment *attach,
 					enum dma_data_direction direction)
@@ -606,6 +662,7 @@ EXPORT_SYMBOL_GPL(dma_buf_map_attachment);
  * @sg_table:	[in]	scatterlist info of the buffer to unmap
  * @direction:  [in]    direction of DMA transfer
  *
+ * This unmaps a DMA mapping for @attached obtained by dma_buf_map_attachment().
  */
 void dma_buf_unmap_attachment(struct dma_buf_attachment *attach,
 				struct sg_table *sg_table,
@@ -747,7 +804,7 @@ EXPORT_SYMBOL_GPL(dma_buf_kunmap);
  * @dmabuf:	[in]	buffer that should back the vma
  * @vma:	[in]	vma for the mmap
  * @pgoff:	[in]	offset in pages where this mmap should start within the
- * 			dma-buf buffer.
+ *			dma-buf buffer.
  *
  * This function adjusts the passed in vma so that it points at the file of the
  * dma_buf operation. It also adjusts the starting pgoff and does bounds

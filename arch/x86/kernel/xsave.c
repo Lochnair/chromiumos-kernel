@@ -12,6 +12,7 @@
 #include <asm/i387.h>
 #include <asm/fpu-internal.h>
 #include <asm/sigframe.h>
+#include <asm/tlbflush.h>
 #include <asm/xcr.h>
 
 /*
@@ -378,7 +379,7 @@ int __restore_xstate_sig(void __user *buf, void __user *buf_fx, int size)
 		 * thread's fpu state, reconstruct fxstate from the fsave
 		 * header. Sanitize the copied state etc.
 		 */
-		struct xsave_struct *xsave = &tsk->thread.fpu.state->xsave;
+		struct fpu *fpu = &tsk->thread.fpu;
 		struct user_i387_ia32_struct env;
 		int err = 0;
 
@@ -392,14 +393,17 @@ int __restore_xstate_sig(void __user *buf, void __user *buf_fx, int size)
 		 */
 		drop_fpu(tsk);
 
-		if (__copy_from_user(xsave, buf_fx, state_size) ||
-		    __copy_from_user(&env, buf, sizeof(env))) {
+		if (__copy_from_user(&fpu->state->xsave, buf_fx, state_size) ||
+		    __copy_from_user(&env, buf, sizeof(env)) ||
+		    (state_size > offsetof(struct xsave_struct, xsave_hdr) &&
+		     fpu->state->xsave.xsave_hdr.xcomp_bv)) {
+			fpu_finit(fpu);
 			err = -1;
 		} else {
 			sanitize_restored_xstate(tsk, &env, xstate_bv, fx_only);
-			set_used_math();
 		}
 
+		set_used_math();
 		if (use_eager_fpu()) {
 			preempt_disable();
 			math_state_restore();
@@ -453,7 +457,7 @@ static void prepare_fx_sw_frame(void)
  */
 static inline void xstate_enable(void)
 {
-	set_in_cr4(X86_CR4_OSXSAVE);
+	cr4_set_bits(X86_CR4_OSXSAVE);
 	xsetbv(XCR_XFEATURE_ENABLED_MASK, pcntxt_mask);
 }
 
@@ -563,20 +567,6 @@ static void __init setup_init_fpu_buf(void)
 	xsave_state_booting(init_xstate_buf, -1);
 }
 
-static enum { AUTO, ENABLE, DISABLE } eagerfpu = AUTO;
-static int __init eager_fpu_setup(char *s)
-{
-	if (!strcmp(s, "on"))
-		eagerfpu = ENABLE;
-	else if (!strcmp(s, "off"))
-		eagerfpu = DISABLE;
-	else if (!strcmp(s, "auto"))
-		eagerfpu = AUTO;
-	return 1;
-}
-__setup("eagerfpu=", eager_fpu_setup);
-
-
 /*
  * Calculate total size of enabled xstates in XCR0/pcntxt_mask.
  */
@@ -637,20 +627,6 @@ static void __init xstate_enable_boot_cpu(void)
 	prepare_fx_sw_frame();
 	setup_init_fpu_buf();
 
-	/* Auto enable eagerfpu for xsaveopt */
-	if (cpu_has_xsaveopt && eagerfpu != DISABLE)
-		eagerfpu = ENABLE;
-
-	if (pcntxt_mask & XSTATE_EAGER) {
-		if (eagerfpu == DISABLE) {
-			pr_err("eagerfpu not present, disabling some xstate features: 0x%llx\n",
-					pcntxt_mask & XSTATE_EAGER);
-			pcntxt_mask &= ~XSTATE_EAGER;
-		} else {
-			eagerfpu = ENABLE;
-		}
-	}
-
 	pr_info("enabled xstate_bv 0x%llx, cntxt size 0x%x using %s\n",
 		pcntxt_mask, xstate_size,
 		cpu_has_xsaves ? "compacted form" : "standard form");
@@ -691,14 +667,6 @@ void eager_fpu_init(void)
 	clear_used_math();
 	current_thread_info()->status = 0;
 
-	if (eagerfpu == ENABLE)
-		setup_force_cpu_cap(X86_FEATURE_EAGER_FPU);
-
-	if (!cpu_has_eager_fpu) {
-		stts();
-		return;
-	}
-
 	if (boot_func) {
 		boot_func();
 		boot_func = NULL;
@@ -738,3 +706,4 @@ void *get_xsave_addr(struct xsave_struct *xsave, int xstate)
 
 	return (void *)xsave + xstate_comp_offsets[feature];
 }
+EXPORT_SYMBOL_GPL(get_xsave_addr);

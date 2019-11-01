@@ -68,6 +68,10 @@
 		};
 	};
 
+	smc-watchdog {
+		compatible = "arm,smc-watchdog";
+	};
+
 	gpio_keys: gpio-keys {
 		compatible = "gpio-keys";
 		pinctrl-names = "default";
@@ -346,14 +350,23 @@
 &i2c4 {
 	clock-frequency = <400000>;
 	status = "okay";
+	pinctrl-names = "default";
+	pinctrl-0 = <&trackpad_irq>;
 
 	trackpad: trackpad@15 {
 		compatible = "elan,ekth3000";
 		interrupt-parent = <&pio>;
 		interrupts = <117 IRQ_TYPE_LEVEL_LOW>;
-		pinctrl-names = "default";
-		pinctrl-0 = <&trackpad_irq>;
 		reg = <0x15>;
+		wakeup-source;
+	};
+
+	trackpad2: trackpad@2c {
+		compatible = "hid-over-i2c";
+		interrupt-parent = <&pio>;
+		interrupts = <117 IRQ_TYPE_LEVEL_LOW>;
+		reg = <0x2c>;
+		hid-descr-addr = <0x0020>;
 		wakeup-source;
 	};
 
@@ -1088,6 +1101,10 @@
 	pinctrl-0 = <&usb_pins>;
 	vusb33-supply = <&mt6397_vusb_reg>;
 	mediatek,wakeup-src = <1>;
+};
+
+&watchdog {
+	status = "disabled";
 };
 
 #include "../../../../arm/boot/dts/cros-ec-keyboard.dtsi"

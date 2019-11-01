@@ -35,6 +35,7 @@
 
 static DECLARE_WAIT_QUEUE_HEAD(low_mem_wait);
 static atomic_t low_mem_state = ATOMIC_INIT(0);
+atomic_t in_low_mem_check = ATOMIC_INIT(0);
 
 /* This is a list of thresholds in pages and should be in ascending order. */
 unsigned long low_mem_thresholds[LOW_MEM_THRESHOLD_MAX] = { 50 * MB / PAGE_SIZE };
@@ -46,13 +47,8 @@ bool low_mem_margin_enabled = true;
 
 unsigned int low_mem_ram_vs_swap_weight = 4;
 
-/*
- * We're interested in worst-case anon memory usage when the low-memory
- * notification fires.  To contain logging, we limit our interest to
- * non-trivial steps.
- */
-unsigned long low_mem_lowest_seen_anon_mem;
-const unsigned long low_mem_anon_mem_delta = 10 * MB / PAGE_SIZE;
+/* Limit logging low memory to once per second. */
+DEFINE_RATELIMIT_STATE(low_mem_logging_ratelimit, 1 * HZ, 1);
 
 static struct kernfs_node *low_mem_available_dirent;
 
@@ -241,8 +237,7 @@ static ssize_t low_mem_available_show(struct kobject *kobj,
 				      struct kobj_attribute *attr,
 				      char *buf)
 {
-	const int lru_base = NR_LRU_BASE - LRU_BASE;
-	unsigned long available_mem = get_available_mem_adj(lru_base);
+	unsigned long available_mem = get_available_mem_adj();
 
 	return sprintf(buf, "%lu\n",
 		       available_mem / (MB / PAGE_SIZE));
@@ -291,7 +286,6 @@ static int __init low_mem_init(void)
 	if (!low_mem_available_dirent)
 		pr_warn("unable to find dirent for \"available\" attribute\n");
 
-	low_mem_lowest_seen_anon_mem = totalram_pages;
 	return err;
 }
 module_init(low_mem_init)

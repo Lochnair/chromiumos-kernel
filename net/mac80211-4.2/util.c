@@ -1709,7 +1709,6 @@ static void ieee80211_handle_reconfig_failure(struct ieee80211_local *local)
 
 	local->resuming = false;
 	local->suspended = false;
-	local->started = false;
 
 	/* scheduled scan clearly can't be running any more, but tell
 	 * cfg80211 and clear local state
@@ -1786,6 +1785,8 @@ int ieee80211_reconfig(struct ieee80211_local *local)
 		reconfig_due_to_wowlan = true;
 	}
 #endif
+
+	local->started = false;
 
 	/*
 	 * Upon resume hardware can sometimes be goofy due to

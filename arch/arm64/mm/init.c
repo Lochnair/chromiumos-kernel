@@ -36,6 +36,7 @@
 #include <linux/swiotlb.h>
 
 #include <asm/fixmap.h>
+#include <asm/memory.h>
 #include <asm/sections.h>
 #include <asm/setup.h>
 #include <asm/sizes.h>
@@ -70,7 +71,7 @@ early_param("initrd", early_initrd);
  * currently assumes that for memory starting above 4G, 32-bit devices will
  * use a DMA offset.
  */
-static phys_addr_t max_zone_dma_phys(void)
+static phys_addr_t __init max_zone_dma_phys(void)
 {
 	phys_addr_t offset = memblock_start_of_DRAM() & GENMASK_ULL(63, 32);
 	return min(offset + (1ULL << 32), memblock_end_of_DRAM());
@@ -126,11 +127,11 @@ EXPORT_SYMBOL(pfn_valid);
 #endif
 
 #ifndef CONFIG_SPARSEMEM
-static void arm64_memory_present(void)
+static void __init arm64_memory_present(void)
 {
 }
 #else
-static void arm64_memory_present(void)
+static void __init arm64_memory_present(void)
 {
 	struct memblock_region *reg;
 
@@ -305,8 +306,8 @@ void __init mem_init(void)
 		  "    vmemmap : 0x%16lx - 0x%16lx   (%6ld GB maximum)\n"
 		  "              0x%16lx - 0x%16lx   (%6ld MB actual)\n"
 #endif
-		  "    PCI I/O : 0x%16lx - 0x%16lx   (%6ld MB)\n"
 		  "    fixed   : 0x%16lx - 0x%16lx   (%6ld KB)\n"
+		  "    PCI I/O : 0x%16lx - 0x%16lx   (%6ld MB)\n"
 		  "    modules : 0x%16lx - 0x%16lx   (%6ld MB)\n"
 		  "    memory  : 0x%16lx - 0x%16lx   (%6ld MB)\n"
 		  "      .init : 0x%p" " - 0x%p" "   (%6ld KB)\n"
@@ -322,8 +323,8 @@ void __init mem_init(void)
 		  MLM((unsigned long)virt_to_page(PAGE_OFFSET),
 		      (unsigned long)virt_to_page(high_memory)),
 #endif
-		  MLM((unsigned long)PCI_IOBASE, (unsigned long)PCI_IOBASE + SZ_16M),
 		  MLK(FIXADDR_START, FIXADDR_TOP),
+		  MLM(PCI_IO_START, PCI_IO_END),
 		  MLM(MODULES_VADDR, MODULES_END),
 		  MLM(PAGE_OFFSET, (unsigned long)high_memory),
 		  MLK_ROUNDUP(__init_begin, __init_end),

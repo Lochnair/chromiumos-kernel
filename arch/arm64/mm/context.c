@@ -26,14 +26,35 @@
 #include <asm/mmu_context.h>
 #include <asm/tlbflush.h>
 #include <asm/cachetype.h>
+#include <asm/alternative.h>
 
-#define asid_bits(reg) \
-	(((read_cpuid(ID_AA64MMFR0_EL1) & 0xf0) >> 2) + 8)
 
 #define ASID_FIRST_VERSION	(1 << MAX_ASID_BITS)
 
 static DEFINE_RAW_SPINLOCK(cpu_asid_lock);
 unsigned int cpu_last_asid = ASID_FIRST_VERSION;
+
+/* Get the ASIDBits supported by the current CPU */
+static u32 get_cpu_asid_bits(void)
+{
+	u32 asid;
+	int fld = cpuid_feature_extract_field(read_cpuid(ID_AA64MMFR0_EL1),
+						ID_AA64MMFR0_ASID_SHIFT);
+
+	switch (fld) {
+	default:
+		pr_warn("CPU%d: Unknown ASID size (%d); assuming 8-bit\n",
+					smp_processor_id(),  fld);
+		/* Fallthrough */
+	case 0:
+		asid = 8;
+		break;
+	case 2:
+		asid = 16;
+	}
+
+	return asid;
+}
 
 /*
  * We fork()ed a process, and we need a new context for the child to run in.
@@ -92,12 +113,21 @@ static void reset_context(void *info)
 	unsigned int cpu = smp_processor_id();
 	struct mm_struct *mm = current->active_mm;
 
+	/*
+	 * current->active_mm could be init_mm for the idle thread immediately
+	 * after secondary CPU boot or hotplug. TTBR0_EL1 is already set to
+	 * the reserved value, so no need to reset any context.
+	 */
+	if (mm == &init_mm)
+		return;
+
 	smp_rmb();
 	asid = cpu_last_asid + cpu;
 
 	flush_context();
 	set_mm_context(mm, asid);
 
+	arm64_apply_bp_hardening();
 	/* set the new ASID */
 	cpu_switch_mm(mm->pgd, mm);
 }
@@ -112,10 +142,19 @@ static inline void set_mm_context(struct mm_struct *mm, unsigned int asid)
 
 #endif
 
+/* Errata workaround post TTBRx_EL1 update. */
+asmlinkage void post_ttbr_update_workaround(void)
+{
+	asm(ALTERNATIVE("nop; nop; nop",
+			"ic iallu; dsb nsh; isb",
+			ARM64_WORKAROUND_CAVIUM_27456,
+			CONFIG_CAVIUM_ERRATUM_27456));
+}
+
 void __new_context(struct mm_struct *mm)
 {
 	unsigned int asid;
-	unsigned int bits = asid_bits();
+	unsigned int bits = get_cpu_asid_bits();
 
 	raw_spin_lock(&cpu_asid_lock);
 #ifdef CONFIG_SMP

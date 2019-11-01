@@ -1106,25 +1106,29 @@ static void mtk_venc_worker(struct work_struct *work)
 	src_buf = v4l2_m2m_src_buf_remove(ctx->m2m_ctx);
 	memset(&frm_buf, 0, sizeof(frm_buf));
 	for (i = 0; i < src_buf->num_planes ; i++) {
-		frm_buf.fb_addr[i].va = vb2_plane_vaddr(src_buf, i);
+		/*
+		 * TODO(crbug.com/901264): The way to pass an offset within a
+		 * DMA-buf is not defined in V4L2 specification, so we abuse
+		 * data_offset for now. Fix it when we have the right interface,
+		 * including any necessary validation and potential alignment
+		 * issues.
+		 */
 		frm_buf.fb_addr[i].dma_addr =
-				vb2_dma_contig_plane_dma_addr(src_buf, i);
-		frm_buf.fb_addr[i].size =
-				(size_t)src_buf->planes[i].length;
+				vb2_dma_contig_plane_dma_addr(src_buf, i) +
+			src_buf->planes[i].data_offset;
+		frm_buf.fb_addr[i].size = (size_t)src_buf->planes[i].length -
+			src_buf->planes[i].data_offset;
 	}
 	bs_buf.va = vb2_plane_vaddr(dst_buf, 0);
 	bs_buf.dma_addr = vb2_dma_contig_plane_dma_addr(dst_buf, 0);
 	bs_buf.size = (size_t)dst_buf->planes[0].length;
 
 	mtk_v4l2_debug(2,
-			"Framebuf VA=%p PA=%llx Size=0x%lx;VA=%p PA=0x%llx Size=0x%lx;VA=%p PA=0x%llx Size=%zu",
-			frm_buf.fb_addr[0].va,
+			"Framebuf PA=%llx Size=0x%lx;PA=0x%llx Size=0x%lx;PA=0x%llx Size=%zu",
 			(u64)frm_buf.fb_addr[0].dma_addr,
 			frm_buf.fb_addr[0].size,
-			frm_buf.fb_addr[1].va,
 			(u64)frm_buf.fb_addr[1].dma_addr,
 			frm_buf.fb_addr[1].size,
-			frm_buf.fb_addr[2].va,
 			(u64)frm_buf.fb_addr[2].dma_addr,
 			frm_buf.fb_addr[2].size);
 

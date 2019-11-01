@@ -30,9 +30,11 @@
 #include <linux/highmem.h>
 #include <linux/perf_event.h>
 
+#include <asm/cpufeature.h>
 #include <asm/exception.h>
 #include <asm/debug-monitors.h>
 #include <asm/esr.h>
+#include <asm/sysreg.h>
 #include <asm/system_misc.h>
 #include <asm/pgtable.h>
 #include <asm/tlbflush.h>
@@ -219,10 +221,17 @@ static int __kprobes do_page_fault(unsigned long addr, unsigned int esr,
 
 	if (esr & ESR_LNX_EXEC) {
 		vm_flags = VM_EXEC;
-	} else if ((esr & ESR_EL1_WRITE) && !(esr & ESR_EL1_CM)) {
+	} else if ((esr & ESR_ELx_WNR) && !(esr & ESR_ELx_CM)) {
 		vm_flags = VM_WRITE;
 		mm_flags |= FAULT_FLAG_WRITE;
 	}
+
+	/*
+	 * PAN bit set implies the fault happened in kernel space, but not
+	 * in the arch's user access functions.
+	 */
+	if (IS_ENABLED(CONFIG_ARM64_PAN) && (regs->pstate & PSR_PAN_BIT))
+		goto no_context;
 
 	/*
 	 * As per x86, we may deadlock here. However, since the kernel only
@@ -471,6 +480,29 @@ asmlinkage void __exception do_mem_abort(unsigned long addr, unsigned int esr,
 	arm64_notify_die("", regs, &info, esr);
 }
 
+asmlinkage void __exception do_el0_irq_bp_hardening(void)
+{
+	/* PC has already been checked in entry.S */
+	arm64_apply_bp_hardening();
+}
+
+asmlinkage void __exception do_el0_ia_bp_hardening(unsigned long addr,
+						   unsigned int esr,
+						   struct pt_regs *regs)
+{
+	/*
+	 * We've taken an instruction abort from userspace and not yet
+	 * re-enabled IRQs. If the address is a kernel address, apply
+	 * BP hardening prior to enabling IRQs and pre-emption.
+	 */
+	if (addr > TASK_SIZE)
+		arm64_apply_bp_hardening();
+
+	local_irq_enable();
+	do_mem_abort(addr, esr, regs);
+}
+
+
 /*
  * Handle stack alignment exceptions.
  */
@@ -479,6 +511,13 @@ asmlinkage void __exception do_sp_pc_abort(unsigned long addr,
 					   struct pt_regs *regs)
 {
 	struct siginfo info;
+
+	if (user_mode(regs)) {
+		if (instruction_pointer(regs) > TASK_SIZE)
+			arm64_apply_bp_hardening();
+		local_irq_enable();
+	}
+
 
 	info.si_signo = SIGBUS;
 	info.si_errno = 0;
@@ -517,6 +556,9 @@ asmlinkage int __exception do_debug_exception(unsigned long addr,
 	const struct fault_info *inf = debug_fault_info + DBG_ESR_EVT(esr);
 	struct siginfo info;
 
+	if (user_mode(regs) && instruction_pointer(regs) > TASK_SIZE)
+		arm64_apply_bp_hardening();
+
 	if (!inf->fn(addr, esr, regs))
 		return 1;
 
@@ -531,3 +573,11 @@ asmlinkage int __exception do_debug_exception(unsigned long addr,
 
 	return 0;
 }
+
+#ifdef CONFIG_ARM64_PAN
+int cpu_enable_pan(void *__unused)
+{
+	config_sctlr_el1(SCTLR_EL1_SPAN, 0);
+	return 0;
+}
+#endif /* CONFIG_ARM64_PAN */

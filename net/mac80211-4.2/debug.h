@@ -162,7 +162,7 @@ do {									\
 		   sdata, fmt, ##__VA_ARGS__)
 
 #define mpath_dbg(sdata, fmt, ...)					\
-	_sdata_info(				\
+	_sdata_dbg(MAC80211_MPATH_DEBUG,				\
 		   sdata, fmt, ##__VA_ARGS__)
 
 #define mhwmp_dbg(sdata, fmt, ...)					\

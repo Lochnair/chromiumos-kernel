@@ -114,6 +114,8 @@ source "drivers/rtc/Kconfig"
 
 source "drivers/dma/Kconfig"
 
+source "drivers/dma-buf/Kconfig"
+
 source "drivers/dca/Kconfig"
 
 source "drivers/auxdisplay/Kconfig"
@@ -191,5 +193,7 @@ source "drivers/amba/Kconfig"
 source "drivers/cpuquiet/Kconfig"
 
 source "drivers/nvmem/Kconfig"
+
+source "drivers/pkglist/Kconfig"
 
 endmenu

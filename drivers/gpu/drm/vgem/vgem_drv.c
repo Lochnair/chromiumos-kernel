@@ -67,12 +67,19 @@ static void vgem_gem_free_object(struct drm_gem_object *obj)
 
 	vgem_obj->pages = NULL;
 
+	if (vgem_obj->sgt)
+		sg_free_table(vgem_obj->sgt);
+
+	vgem_obj->sgt = NULL;
+
 	kfree(vgem_obj);
 }
 
 int vgem_gem_get_pages(struct drm_vgem_gem_object *obj)
 {
-	int ret = 0;
+	loff_t num_pages;
+	struct scatterlist *s;
+	int i, ret = 0;
 
 	if (obj->pages || obj->base.import_attach)
 		return 0;
@@ -83,6 +90,18 @@ int vgem_gem_get_pages(struct drm_vgem_gem_object *obj)
 		obj->pages = NULL;
 		return ret;
 	}
+
+	num_pages = DIV_ROUND_UP(obj->base.size, PAGE_SIZE);
+	obj->sgt = drm_prime_pages_to_sg(obj->pages, num_pages);
+	if (IS_ERR(obj->sgt)) {
+		drm_gem_put_pages(&obj->base, obj->pages, false, false);
+		return PTR_ERR(obj->sgt);
+	}
+
+	for_each_sg(obj->sgt->sgl, s, obj->sgt->nents, i)
+		sg_dma_address(s) = sg_phys(s);
+
+	drm_clflush_sg(obj->base.dev, obj->sgt);
 
 	return 0;
 }

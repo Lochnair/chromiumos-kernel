@@ -288,14 +288,22 @@ enum oom_scan_t oom_scan_process_thread(struct task_struct *task,
 		if (unlikely(frozen(task)))
 			__thaw_task(task);
 		if (!force_kill) {
-			if (time_after(jiffies,
-				       last_victim + msecs_to_jiffies(100))) {
-				pr_warn("Task %s:%d refused to die\n",
-					task->comm, task->pid);
-				if (task->state != TASK_RUNNING) {
-					sched_show_task(task);
-					return OOM_SCAN_CONTINUE;
-				}
+			/*
+			 * When failing to kill for more than 2000 ms, select
+			 * another victim unconditionally. When failing to kill
+			 * for more than 100 ms, select another victim if the
+			 * current victim is not runnable.
+			 */
+			if (time_after(jiffies, last_victim + HZ * 2) ||
+			    (time_after(jiffies, last_victim + HZ / 10) &&
+			     task->state != TASK_RUNNING)) {
+				pr_warn("Task %s:%d refused to die (killer %s:%d:%d, nvcsw=%lu, nivcsw=%lu)\n",
+					task->comm, task->pid, current->comm,
+					current->pid, current->tgid,
+					current->nvcsw, current->nivcsw);
+				sched_show_task(task);
+				last_victim = jiffies;
+				return OOM_SCAN_CONTINUE;
 			}
 			return OOM_SCAN_ABORT;
 		}
@@ -541,10 +549,12 @@ void oom_kill_process(struct task_struct *p, gfp_t gfp_mask, int order,
 	do_send_sig_info(SIGKILL, SEND_SIG_FORCED, victim, true);
 	set_tsk_thread_flag(victim, TIF_MEMDIE);
 	last_victim = jiffies;
-	pr_err("Killed process %d (%s) total-vm:%lukB, anon-rss:%lukB, file-rss:%lukB\n",
+	count_vm_event(OOM_KILL);
+	pr_err("Killed process %d (%s) total-vm:%lukB, anon-rss:%lukB, file-rss:%lukB, shmem-rss:%lukB\n",
 		task_pid_nr(victim), victim->comm, K(victim->mm->total_vm),
 		K(get_mm_counter(victim->mm, MM_ANONPAGES)),
-		K(get_mm_counter(victim->mm, MM_FILEPAGES)));
+		K(get_mm_counter(victim->mm, MM_FILEPAGES)),
+		K(get_mm_counter(victim->mm, MM_SHMEMPAGES)));
 	task_unlock(victim);
 
 	/*

@@ -17,6 +17,8 @@
 
 #define MESH_BYPASS_ROUTING_FOR_TEST_FRAMES
 
+extern const u32 mesh_time_constant;
+
 /* Data structures */
 
 /**

@@ -19,6 +19,9 @@ static int udl_driver_set_busid(struct drm_device *d, struct drm_master *m)
 static int udl_usb_suspend(struct usb_interface *interface,
 			   pm_message_t message)
 {
+	struct drm_device *dev = usb_get_intfdata(interface);
+
+	drm_kms_helper_poll_disable(dev);
 	return 0;
 }
 
@@ -26,6 +29,7 @@ static int udl_usb_resume(struct usb_interface *interface)
 {
 	struct drm_device *dev = usb_get_intfdata(interface);
 
+	drm_kms_helper_poll_enable(dev);
 	udl_modeset_restore(dev);
 	return 0;
 }

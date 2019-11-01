@@ -181,6 +181,27 @@ enum {
 #define TCA_TBF_MAX (__TCA_TBF_MAX - 1)
 
 
+/* ARL section */
+struct tc_arl_xstats {
+	__u32   max_bw;		/* The maxmium bw measured */
+	__u32   min_rate;	/* The lowest base rate */
+	__u32   current_rate;	/* The current base rate */
+	__u32   latency;	/* The current latency */
+};
+
+enum {
+	TCA_ARL_UNSPEC,
+	TCA_ARL_BUFFER,
+	TCA_ARL_MIN_RATE,
+	TCA_ARL_MAX_BW,
+	TCA_ARL_LIMIT,
+	TCA_ARL_MAX_LATENCY,
+	TCA_ARL_LATENCY_HYSTERESIS,
+	__TCA_ARL_MAX,
+};
+#define TCA_ARL_MAX (__TCA_ARL_MAX - 1)
+
+
 /* TEQL section */
 
 /* TEQL does not require any parameters */

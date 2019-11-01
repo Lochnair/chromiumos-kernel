@@ -1,4 +1,4 @@
-/* Copyright (c) 2010-2015, The Linux Foundation. All rights reserved.
+/* Copyright (c) 2010-2015, 2018 The Linux Foundation. All rights reserved.
  * Copyright (C) 2015 Linaro Ltd.
  *
  * This program is free software; you can redistribute it and/or modify
@@ -12,6 +12,12 @@
  */
 #ifndef __QCOM_SCM_H
 #define __QCOM_SCM_H
+
+#define QTI_SCM_SVC_BOOT	0x1
+#define QTI_SCM_CMD_USER_READ	0x17
+#define QTI_SCM_CMD_USER_WRITE	0x16
+#define QTI_SCM_SVC_IO_ACCESS	0x5
+#define QTI_SCM_IO_WRITE	0x2
 
 extern int qcom_scm_set_cold_boot_addr(void *entry, const cpumask_t *cpus);
 extern int qcom_scm_set_warm_boot_addr(void *entry, const cpumask_t *cpus);
@@ -40,5 +46,11 @@ extern u32 qcom_scm_get_version(void);
 #define SCM_CMD_SET_REGSAVE	0x2
 
 extern int qcom_scm_regsave(u32 svc_id, u32 cmd_id);
+
+int qcom_scm_call(u32 svc_id, u32 cmd_id, const void *cmd_buf,
+			size_t cmd_len, void *resp_buf, size_t resp_len);
+
+s32 qti_scm_call_atomic2(u32 svc, u32 cmd, u32 arg1, u32 arg2);
+
 
 #endif
