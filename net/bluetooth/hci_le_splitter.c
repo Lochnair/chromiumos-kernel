@@ -606,8 +606,8 @@ static void hci_le_splitter_enq_packet(struct sk_buff *skb)
 	mutex_lock(&usr_msg_q_lock);
 	if (MAX_RX_QUEUE_SZ - usr_msg_q_len < skb->len) {
 
-		pr_err("enqueue failed - not enough space to enqueue %u bytes over %zu\n",
-		       skb->len, usr_msg_q_len);
+		pr_err("enqueue failed - not enough space to enqueue %u bytes over %u\n",
+		     skb->len, usr_msg_q_len);
 		kfree_skb(skb);
 	} else {
 		usr_msg_q_len += skb->len;
