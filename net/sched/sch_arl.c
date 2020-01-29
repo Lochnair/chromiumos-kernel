@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0
 /* Adaptive Rate Limiting Qdisc (ARL) is designed for home routers to eliminate
  * bufferbloat at upstream CPE (Cable/DSL) modem. It prevents bloated queue
- * from forming at upstream CPE modem by rate limit egress throughput to match
- * the available bandwidth. Instead of using a preconfigured static rate limit.
- * It automatically figures out the available upstream bandwidth and adjust
- * rate limit in real time, by continuously monitoring latency passively.
- * There are two sources of latency measurement, one is the RTT from kernel’s
+ * from forming at upstream CPE modem by rate shaping the throughput to match
+ * the available bandwidth. Instead of using a preconfigured static rate limit,
+ * it automatically figures out the available bandwidth and adjust rate limit
+ * in real time, by continuously monitoring latency passively.
+ * The latency measurement come from two sources: one is the RTT from kernel’s
  * TCP/IP stacks, another is the half path RTT measured from routed TCP
  * streams. The minimum latency from all flows is used as the indication of
  * bufferbloat at upstream CPE modem, because that’s the common path for all
@@ -18,12 +18,15 @@
  * ARL can be applied as root qdisc for WAN interface to prevent upstream
  * bufferbloat at the CPE modem. Queue is then managed locally at the
  * router, by applying another qdisc such as fq_codel as child qdisc.
+ * In order to use ARL for downstream (ingress), an IFB device needs be created
+ * and setup filter rule to redirect ingress traffic to the IFB device, then
+ * apply ARL in ingress mode as the root qdisc for the IFB device
  *
  * The passive latency measurement method for routed TCP stream is inspired by:
  * Kathleen Nichols, "Listening to Networks",
  * http://netseminar.stanford.edu/seminars/02_02_17.pdf
  *
- * The rate shaping and some utility functions are copied from:
+ * The rate shaping and some utility functions are from:
  * net/sched/sch_tbf.c
  * Author:	Kan Yan	<kyan@google.com>
  */
@@ -47,19 +50,19 @@
 
 #include "sch_arl.h"
 
-#define ARL_SCALE	7	/* 128B per sec, approximatly 1kbps */
-#define ARL_BW_UNIT	BIT(7) /* 128B per sec, approximatly 1kbps */
+#define ARL_SCALE	7	/* 128 Byte per second, approximately 1kbps */
+#define ARL_BW_UNIT	BIT(7) /* 128 Byte per second, approximately 1kbps */
 
 /* High gain to exponentially increase bw. Double the BW in 20 cycles */
-static const int ARL_HIGH_GAIN = ARL_BW_UNIT *  1035 / 1000;
+static const int ARL_HIGH_GAIN = ARL_BW_UNIT * 1035 / 1000;
 /* Drain gain: half the rate in two cycles */
 static const int ARL_DRAIN_GAIN = ARL_BW_UNIT * 707 / 1000;
 
-static bool arl_latency_sampling_enanbled;
+static bool arl_latency_sampling_enabled;
 static int arl_dev_index = -1;
 
 /* The rate for each phase is:
- * base_rate + rate_delta * arl_rate_tbl[mode][phase]
+ * base_rate + rate_delta * arl_rate_tbl[state][phase]
  */
 static const int arl_rate_tbl[][ARL_CYCLE_LEN] = {
 			{0, 0, 0, 0},		/* STABLE */
@@ -69,7 +72,7 @@ static const int arl_rate_tbl[][ARL_CYCLE_LEN] = {
 			{0, 0, 0, 0},		/* UNTHROTTLED */
 			};
 
-static void arl_bw_est_reset(struct arl_sched_data *q)
+static void arl_bw_estimate_reset(struct arl_sched_data *q)
 {
 	q->vars.bw_est_start_t = jiffies;
 	q->vars.bw_est_bytes_sent = 0;
@@ -95,16 +98,29 @@ static void arl_update_bw_estimate(struct arl_sched_data *q)
 			   bw_avg);
 	if (bw_avg > q->stats.max_bw)
 		q->stats.max_bw = bw_avg;
-	arl_bw_est_reset(q);
+	arl_bw_estimate_reset(q);
 }
 
 static bool arl_is_latency_high(struct arl_sched_data *q)
 {
-	u32 lt_min_hrtt = minmax_get(&q->vars.lt_min_hrtt);
+	u32 lt_min_hrtt, st_min_hrtt;
 
-	if ((minmax_get(&q->vars.st_min_hrtt) < (lt_min_hrtt +
-	   q->params.latency_hysteresis)) &&
-	   (minmax_get(&q->vars.min_hrtt) < q->params.max_latency))
+	/* return true only when there is recent latency measurement */
+	if (time_after(jiffies, q->vars.last_latency_upd_t +
+		       msecs_to_jiffies(q->vars.phase_dur * ARL_CYCLE_LEN * 2)))
+		return false;
+
+	lt_min_hrtt = minmax_get(&q->vars.lt_min_hrtt);
+	st_min_hrtt = minmax_get(&q->vars.st_min_hrtt);
+
+	/* consider latency is high if the short term smoothed latency is
+	 * significantly (>latency_hysteresis) higher than
+	 * max(ARL_LOW_LATENCY, lt_min_hrtt) and higher than the ARL parameter
+	 * "max_latency".
+	 */
+	if ((st_min_hrtt < q->params.latency_hysteresis +
+	    max_t(u32, ARL_LOW_LATENCY, lt_min_hrtt)) &&
+	    minmax_get(&q->vars.min_hrtt) < q->params.max_latency)
 		return false;
 	else
 		return true;
@@ -113,28 +129,53 @@ static bool arl_is_latency_high(struct arl_sched_data *q)
 /* Check if the bandwidth is fully used.
  * Return true if the measured throughput is above ~92% of the configured rate.
  */
-static bool arl_is_bw_full(struct arl_sched_data *q)
+static bool arl_is_under_load(struct arl_sched_data *q)
 {
-	u32 rate = q->vars.base_rate;
+	u32 rate = q->vars.current_rate;
 
 	return (q->vars.bw_est > (rate - ((rate * 10) >> ARL_SCALE))) ? true :
 		false;
 }
 
-static bool arl_check_drain(struct arl_sched_data *q)
+static bool arl_is_throttling(struct arl_sched_data *q)
 {
-	if (q->vars.mode != ARL_LATENCY_PROBE)
+	if (!q->qdisc)
 		return false;
 
+	/* consider ARL is throttling the traffic if it causes significant
+	 * backlog (sojourn time > 1/2 CoDel target).
+	 */
+	return psched_l2t_ns(&q->vars.rate, q->qdisc->qstats.backlog) >
+			     q->params.target * NSEC_PER_USEC / 2 ? 1 : 0;
+}
+
+/* Check if ARL should enter DRAIN state. Periodically DRAIN the queue helps
+ * find the true minmium latency.
+ */
+static bool arl_check_drain(struct arl_sched_data *q)
+{
+	if (q->vars.state != ARL_LATENCY_PROBE && q->vars.state != ARL_STABLE)
+		return false;
+
+	/* No need to DRAIN if latency is low */
 	if (minmax_get(&q->vars.st_min_hrtt) < ARL_LOW_LATENCY)
 		return false;
 
-	if (!arl_is_bw_full(q))
+	/* No need to DRAIN unless it is under load */
+	if (!arl_is_under_load(q))
+		return false;
+
+	/* For INGRESS mode, if ARL is throttling the traffic, it is already
+	 * draining the queue, so no need to enter the DRAIN mode.
+	 */
+	if (q->params.mode == ARL_INGRESS && arl_is_throttling(q) &&
+	    !arl_is_latency_high(q))
 		return false;
 
 	if (minmax_get(&q->vars.min_hrtt) > q->params.max_latency)
 		return true;
 
+	/* periodically enter DRAIN state for Egress mode if it is under load */
 	if (ktime_ms_delta(q->vars.phase_start_t, q->vars.last_drain_t)
 	     > ARL_DRAIN_INTERVAL)
 		return true;
@@ -149,251 +190,375 @@ static void arl_apply_new_rate(struct arl_sched_data *q, u64 next_rate)
 	next_rate *= 1000;
 	psched_ratecfg_precompute(&q->vars.rate, &q->vars.cfg_rate, next_rate);
 	/* The buffer is burst size in ns, ensure it is large enough to
-	 * transmit max_size packet.
+	 * transmit a max_size packet.
 	 */
 	buffer = psched_l2t_ns(&q->vars.rate, q->params.max_size);
 	q->vars.buffer = max(buffer, q->params.buffer);
 }
 
-static void arl_change_mode(struct arl_sched_data *q, int mode)
+static void arl_change_state(struct arl_sched_data *q, int new_state)
 {
-	struct	arl_vars *vars = &q->vars;
+	struct arl_vars *vars = &q->vars;
 	u64	next_rate;
-	u32	bw;
+	u32	bw, dur_min, dur_max;
 
 	vars->phase = 0;
 	vars->cycle_cnt = 0;
 	vars->phase_start_t = ktime_get();
 	vars->latency_trend = 0;
-	vars->phase_dur = ARL_PHASE_DUR_MAX;
 	vars->rate_factor = ARL_BW_UNIT;
 
-	if (vars->mode == mode)
+	if (q->params.mode == ARL_INGRESS) {
+		dur_min = ARL_INGRESS_PHASE_DUR_MIN;
+		dur_max = ARL_INGRESS_PHASE_DUR_MAX;
+	} else {
+		dur_min = ARL_PHASE_DUR_MIN;
+		dur_max = ARL_PHASE_DUR_MAX;
+	}
+
+	vars->phase_dur = clamp((u32)(2 * minmax_get(&vars->st_min_hrtt)
+				/ USEC_PER_MSEC), dur_min, dur_max);
+
+	if (vars->state == new_state)
 		return;
 
-	vars->phase_dur = clamp((2 * minmax_get(&vars->st_min_hrtt)
-				/ USEC_PER_MSEC), ARL_PHASE_DUR_MIN,
-				ARL_PHASE_DUR_MAX);
+	/* observed available bandwidth at the end of previous state */
+	bw = max_t(u32, ewma_read(&vars->bw_avg), vars->bw_est);
 
-	if (mode == ARL_UNTHROTTLED && vars->bw_est > q->params.max_bw)
-		arl_latency_sampling_enanbled = false;
-	else if (vars->mode == ARL_UNTHROTTLED)
-		arl_latency_sampling_enanbled = true;
+	if (vars->state == ARL_DRAIN || new_state == ARL_LATENCY_PROBE) {
+		/* Leaving drain state or enter LATENCY_PROBE, restore bw to
+		 * the last stable measurement of bw.
+		 */
+		bw = vars->last_stable_base_rate;
+		if (arl_is_latency_high(q))
+			vars->next_bw_probe_t = jiffies +
+						msecs_to_jiffies(60 *
+								 MSEC_PER_SEC);
+	} else if (vars->state == ARL_BW_PROBE) {
+		/* Use the bw from previous cycle to avoid overshot */
+		bw = max_t(u32, ewma_read(&vars->bw_avg),
+			   vars->last_bw_est);
+	} else if (q->params.mode == ARL_EGRESS) {
+		/* For egress mode, reduce BW to offset the overshot due to
+		 * increased BW when exit UNTHROTTLED state.
+		 * It is not needed for ingress mode as the measured BW should
+		 * be the actual available bandwidth.
+		 */
+		if (vars->state == ARL_UNTHROTTLED)
+			bw -= (bw >> ARL_SCALE) * 5;
+		else if (time_after(jiffies, vars->last_latency_upd_t +
+				    msecs_to_jiffies(ARL_MT_WIN)) ||
+			 arl_is_latency_high(q))
+			bw -= (bw >> ARL_SCALE) * 2;
+	}
+	/* adjust for overshot */
+	bw -= (bw >> ARL_SCALE);
 
-	/* Setup new base rate for next state. In general, the base rate should
-	 * set to the available bandwidth measured, if the link is fully used.
-	 * Use instand BW value when enter DRAIN mode, or exit UNTHROTTLED.
-	 * Use the moving average of bw for the other states.
-	 */
-	if (mode == ARL_DRAIN || vars->mode == ARL_UNTHROTTLED)
-		bw = vars->bw_est;
-	else
-		bw = ewma_read(&vars->bw_avg);
-
-	/* Reduce BW to offset the overshot due to increase BW when exit
-	 * UNTHROTTLED or BW_PROBE mode
-	 */
-	if (vars->mode == ARL_UNTHROTTLED)
-		bw -= (bw >> ARL_SCALE) * 12;
-	else if (vars->mode == ARL_BW_PROBE)
-		bw -= (bw >> ARL_SCALE);
-
-	/* Cap bw to previous base_rate when exit LATENCY_PROBE or enter DRAIN
-	 * mode
-	 */
-	if (vars->mode == ARL_LATENCY_PROBE || mode == ARL_DRAIN)
-		bw = min(bw, vars->base_rate);
-
-	/* New base rate for next mode */
+	/* New base rate for next state */
 	vars->base_rate = max(bw, vars->base_rate);
-	/* rate adjustment for next cycle */
-	vars->probe_rate = ((vars->base_rate * ARL_HIGH_GAIN) >> ARL_SCALE);
-	vars->rate_delta = vars->probe_rate - vars->base_rate;
+	vars->last_stable_base_rate = bw;
 
-	/* entering DRAIN mode */
-	if (mode == ARL_DRAIN) {
+	/* set rate for next cycle */
+	switch (new_state) {
+	case  ARL_DRAIN:
 		vars->last_drain_t = ktime_get();
 		vars->phase_dur = minmax_get(&vars->st_min_hrtt) /
 					     USEC_PER_MSEC;
 		vars->phase_dur = clamp(vars->phase_dur, ARL_DRAIN_DUR_MIN,
 					ARL_DRAIN_DUR_MAX);
 
-		/* If latency is high, reduce the base rate to ~70%. */
+		vars->rate_delta = 5 * (vars->base_rate >> ARL_SCALE);
 		if (arl_is_latency_high(q)) {
-			vars->base_rate = (vars->base_rate >> ARL_SCALE)
-					* ARL_DRAIN_GAIN;
-		} else if (arl_is_bw_full(q)) {
-			vars->base_rate -= vars->rate_delta;
+			/* If latency is high, reduce the base rate to ~70%. so
+			 * a [-1, -1, -1, 0] cycle could eliminate ~90% of RTT
+			 * worth of queueing latency.
+			 */
+			vars->rate_delta = vars->base_rate - (vars->base_rate *
+					   ARL_DRAIN_GAIN >> ARL_SCALE);
+			vars->base_rate -= 3 * (vars->base_rate >> ARL_SCALE);
 		}
-		vars->base_rate = max(bw, vars->base_rate);
-		/* set rate_delta to ~33% of base_rate, so a [-1, -1, -1, 0]
-		 * cycle could eliminate RTT worth of queue if the base rate
-		 * is approximately equals to BW.
-		 */
-		vars->rate_delta = vars->base_rate / 3;
+		break;
+
+	case ARL_BW_PROBE:
+		vars->rate_delta = (vars->base_rate * ARL_HIGH_GAIN
+				    >> ARL_SCALE) - vars->base_rate;
+		break;
+
+	case ARL_LATENCY_PROBE:
+		vars->base_rate -= (vars->base_rate >> ARL_SCALE);
+		vars->rate_delta = 5 * (vars->base_rate  >> ARL_SCALE);
+		break;
+
+	default:
+		vars->rate_delta = 0;
 	}
+
+	vars->base_rate = max_t(u32, vars->base_rate, q->params.min_rate);
+	vars->target_rate = vars->base_rate;
+	vars->current_rate = vars->base_rate;
 
 	vars->last_min_hrtt = minmax_get(&vars->st_min_hrtt);
 	vars->min_hrtt_last_cycle = vars->last_min_hrtt;
+	vars->state = new_state;
 
-	vars->mode = mode;
-	vars->base_rate = max_t(u32, vars->base_rate, q->params.min_rate);
-
-	next_rate = vars->rate_delta * arl_rate_tbl[vars->mode][vars->phase]
-		    + vars->base_rate;
+	next_rate = vars->rate_delta * arl_rate_tbl[vars->state][vars->phase]
+		    + vars->current_rate;
 	arl_apply_new_rate(q, next_rate);
-	arl_bw_est_reset(q);
+	arl_bw_estimate_reset(q);
 }
 
-static void arl_update_phase(struct arl_sched_data *q)
+static void arl_update_phase(struct Qdisc *sch)
 {
-	struct	arl_vars *vars = &q->vars;
+	struct arl_sched_data *q = qdisc_priv(sch);
+	struct arl_vars *vars = &q->vars;
 	u64	next_rate;
 	int	latency;
-	bool	is_bw_full, is_latency_high;
+	bool	is_under_load, is_latency_high, is_latency_current,
+		is_throttling;
 
-	if (time_after(jiffies, vars->last_latency_upd +
-	    msecs_to_jiffies(ARL_LT_WIN * 2)) &&
-	    vars->mode != ARL_STABLE) {
-		arl_change_mode(q, ARL_UNTHROTTLED);
-		return;
-	}
+	is_under_load = arl_is_under_load(q);
+	is_throttling = arl_is_throttling(q);
+
+	/* Is latency high compared to long term minimum? */
+	is_latency_high = arl_is_latency_high(q);
+
+	is_latency_current = !time_after(jiffies, vars->last_latency_upd_t +
+					 msecs_to_jiffies(vars->phase_dur *
+					 ARL_CYCLE_LEN * 2));
 
 	if (arl_check_drain(q)) {
-		arl_change_mode(q, ARL_DRAIN);
+		arl_change_state(q, ARL_DRAIN);
 		return;
 	}
-
-	/* update the latency_trend at the end of each phase */
-	latency = minmax_get(&vars->st_min_hrtt);
-	if ((latency + q->params.latency_hysteresis / 2) <
-	    vars->min_hrtt_last_cycle)
-		vars->latency_trend--;
-	else if (latency > (vars->min_hrtt_last_cycle +
-		 q->params.latency_hysteresis / 2))
-		vars->latency_trend++;
-
-	if (latency < ARL_LOW_LATENCY)
-		vars->latency_trend = 0;
 
 	vars->phase = (vars->phase == (ARL_CYCLE_LEN - 1)) ? 0 :
 		       vars->phase + 1;
 	vars->phase_start_t = ktime_get();
 
-	next_rate = vars->rate_delta * arl_rate_tbl[vars->mode][vars->phase]
-		    + vars->base_rate;
-
+	next_rate = vars->rate_delta * arl_rate_tbl[vars->state][vars->phase]
+		    + vars->current_rate;
 	arl_apply_new_rate(q, next_rate);
 
+	latency = minmax_get(&vars->st_min_hrtt);
+
+	/* Update the latency_trend at the end of each phase for egress mode */
+	if (q->params.mode == ARL_EGRESS) {
+		if (!time_after(jiffies, vars->last_latency_upd_t +
+				msecs_to_jiffies(q->vars.phase_dur))) {
+			if (latency + q->params.latency_hysteresis / 2 <
+			    min(vars->min_hrtt_last_cycle, vars->last_min_hrtt))
+				vars->latency_trend--;
+			else if (latency > q->params.latency_hysteresis / 2 +
+			    min(vars->min_hrtt_last_cycle, vars->last_min_hrtt))
+				vars->latency_trend++;
+		}
+	} else if (vars->phase == 0) {
+		/* For ingress mode latency_trend indicates latency has been
+		 * high for how many consective cycles.
+		 */
+		if (is_latency_high)
+			vars->latency_trend++;
+		else
+			vars->latency_trend--;
+	}
+
+	if (latency < ARL_LOW_LATENCY || vars->latency_trend < 0)
+		vars->latency_trend = 0;
+
+	/* Update state for next cycle */
 	if (vars->phase != 0)
 		return;
 
-	/* If there is no updated latency measurement, skip state update */
-	if (time_after(jiffies, vars->last_latency_upd + vars->phase_dur * 4))
-		return;
-
 	arl_update_bw_estimate(q);
-	is_bw_full = arl_is_bw_full(q);
 
-	/* Is latency high compared to long term minimum? */
-	is_latency_high = arl_is_latency_high(q);
+	/* If there is no recent latency, stop adjusting rates for Egress mode.
+	 * For ingress mode, the BW is still get updated based on the current
+	 * measurement of incoming data rate.
+	 */
+	if ((time_after(jiffies, vars->last_latency_upd_t +
+			msecs_to_jiffies(ARL_MT_WIN))) &&
+	    q->params.mode == ARL_EGRESS) {
+		if (vars->state != ARL_STABLE)
+			arl_change_state(q, ARL_STABLE);
+		return;
+	}
 
 	if ((minmax_get(&q->vars.max_bw) > q->params.max_bw) &&
 	    !is_latency_high) {
 		/* The available BW is too high to worry about bufferbloat.
-		 * so disengage the rate limiter to avoid overhead.
+		 * so detach the rate limiter to avoid overhead.
 		 */
-		arl_change_mode(q, ARL_UNTHROTTLED);
+		arl_change_state(q, ARL_UNTHROTTLED);
 		return;
 	}
 
-	switch (vars->mode) {
+	switch (vars->state) {
 	case ARL_STABLE:
-		if (is_latency_high && vars->bw_est > q->params.min_rate) {
-			arl_change_mode(q, ARL_LATENCY_PROBE);
-			return;
+		if (!is_throttling) {
+			vars->last_drain_t = ktime_get();
+			vars->cycle_cnt = 0;
+			break;
 		}
-		if (is_bw_full) {
-			if (vars->latency_trend > 1) {
-				arl_change_mode(q, ARL_LATENCY_PROBE);
-				return;
-			} else if (vars->cycle_cnt > 3) {
-			/* If there is sufficient traffic load, go to BW_PROBE
-			 * after delay for a few cycles.
-			 */
-				arl_change_mode(q, ARL_BW_PROBE);
+
+		if (q->params.mode == ARL_EGRESS) {
+			/* Exit stable state if latency increases under load */
+			if (is_latency_high || vars->latency_trend > 2) {
+				/* If it is not under load, defer a few cycles
+				 * before trying to reduce rate. it maybe just a
+				 * short term glitch or the bloat happened in
+				 * the ingress direction.
+				 */
+				if (is_under_load || vars->cycle_cnt > 3) {
+					arl_change_state(q, ARL_LATENCY_PROBE);
+					return;
+				}
+			} else if (vars->cycle_cnt > 5 &&
+				   time_after(jiffies, vars->next_bw_probe_t)) {
+				arl_change_state(q, ARL_BW_PROBE);
 				return;
 			}
-		} else {
-			vars->last_drain_t = ktime_get();
+			break;
 		}
+
+		/* INGRESS mode
+		 * If the ingress queue is building up when the
+		 * latency increase, then it operates in the
+		 * right direction. CoDel will do its work to
+		 * shrink the latency. Otherwise, the current
+		 * rate is too high and need be reduced.
+		 */
+		if (is_latency_high) {
+			if (vars->latency_trend > 1) {
+				arl_change_state(q, ARL_LATENCY_PROBE);
+				return;
+			}
+			break;
+		}
+
+		vars->current_rate = max_t(u32, vars->current_rate,
+					   ewma_read(&vars->bw_avg));
+
+		/* if the latency is low and the ingress queue builds up, then
+		 * the rate can be increased.
+		 */
+		if (vars->latency_trend == 0) {
+			if (vars->cycle_cnt > 5 && ewma_read(&vars->bw_avg) >
+			    vars->base_rate &&
+			    time_after(jiffies, vars->next_bw_probe_t)) {
+				arl_change_state(q, ARL_BW_PROBE);
+				return;
+			}
+			break;
+		}
+		vars->cycle_cnt = 0;
+		vars->current_rate = vars->base_rate -
+				     (vars->base_rate >>
+				      ARL_SCALE);
+		vars->current_rate = max_t(u32,
+					   vars->current_rate,
+					   ewma_read(&vars->bw_avg));
 		break;
 
 	case ARL_BW_PROBE:
-		if (is_latency_high) {
-			arl_change_mode(q, ARL_LATENCY_PROBE);
-			return;
-		}
-		if (!is_bw_full && vars->cycle_cnt > 3) {
-			arl_change_mode(q, ARL_STABLE);
-			return;
-		} else if (vars->latency_trend >= 2) {
-			arl_change_mode(q, ARL_LATENCY_PROBE);
-			return;
-		}
+		if (q->params.mode == ARL_EGRESS) {
+			/* Exit BW probe state if latency is increasing */
+			if (is_latency_high || vars->latency_trend > 2) {
+				arl_change_state(q, ARL_LATENCY_PROBE);
+				return;
+			}
 
-		/* Switch to high gain if latency is stable. Pause the
-		 * rate_delta increase for one in every 4 phases to observe
-		 * the latecency change. The could be some lag between rate
-		 * change and latency change.
-		 */
-		if (vars->latency_trend == 0 && vars->cycle_cnt % 4)
-			vars->rate_factor = ARL_HIGH_GAIN;
-		else
-			vars->rate_factor = ARL_BW_UNIT;
+			/* Exit to stable state if the traffic is light */
+			if (!is_throttling || vars->latency_trend >= 1) {
+				arl_change_state(q, ARL_STABLE);
+				return;
+			}
 
-		vars->probe_rate = ((vars->probe_rate * vars->rate_factor) >>
-				    ARL_SCALE);
-		vars->rate_delta = vars->probe_rate - vars->base_rate;
-		/* If BW has increased signficantly(>15%) without latency
-		 * increase, switch to UNTHROTTLED mode to quickly figure out
-		 * the available BW.
-		 */
-		if (vars->rate_delta >= vars->base_rate / 4) {
-			vars->rate_delta = max_t(u32, vars->rate_delta,
-						 vars->base_rate / 2);
-			if (vars->bw_est > vars->base_rate * 115 / 100) {
-				arl_change_mode(q, ARL_UNTHROTTLED);
+			/* If BW has increased signficantly (>30%)
+			 * without latency increase, switch to UNTHROTTLED state
+			 * to figure out the available BW quickly.
+			 */
+			if (vars->cycle_cnt > 9) {
+				if (vars->bw_est > vars->base_rate * 130 / 100)
+					arl_change_state(q, ARL_UNTHROTTLED);
+				else
+					arl_change_state(q, ARL_STABLE);
+				return;
+			}
+		} else {
+			if (vars->latency_trend > 0) {
+				arl_change_state(q, ARL_LATENCY_PROBE);
+				return;
+			}
+
+			if (!is_throttling || !is_latency_current) {
+				/* For ingress, exit to stable state if not
+				 * throttling the traffic and lost latency
+				 * measurement.
+				 */
+				arl_change_state(q, ARL_STABLE);
 				return;
 			}
 		}
-		if (vars->cycle_cnt > 20) {
-			arl_change_mode(q, ARL_STABLE);
-			return;
+
+		/* Update probe rate every 3 cycles */
+		if (vars->cycle_cnt % 3 == 2) {
+			/* Go to stable state if the measured bw stops
+			 * increasing
+			 */
+			if (vars->bw_est < vars->base_rate) {
+				arl_change_state(q, ARL_STABLE);
+				return;
+			}
+			vars->current_rate = max_t(u32, vars->current_rate,
+						   ewma_read(&vars->bw_avg));
+			vars->target_rate = vars->current_rate;
+
+			/* Pause the rate_delta increase for one in every 3
+			 * cycles to observe the latency change. There could
+			 * be some lags between rate change and latency change.
+			 */
+			vars->rate_factor = ARL_BW_UNIT;
+		} else {
+			/* Switch to high gain if latency is stable. */
+			vars->rate_factor = ARL_HIGH_GAIN;
 		}
+
+		/* Ingress Mode, rate is updated every cycle to the
+		 * observed bandwidth.
+		 */
+		if (q->params.mode == ARL_INGRESS)
+			vars->current_rate = max(vars->current_rate,
+						 vars->bw_est);
+		/* update rate for next cycle */
+		vars->target_rate = vars->target_rate *
+					vars->rate_factor >> ARL_SCALE;
+		vars->rate_delta = vars->target_rate -
+					vars->current_rate;
+		vars->rate_delta = min_t(u32, vars->rate_delta,
+					 vars->base_rate / 10);
 		break;
 
 	case ARL_LATENCY_PROBE:
 		if (!is_latency_high || vars->bw_est < q->params.min_rate) {
-		/* If latency is no longer high or cannot be further reduced,
-		 * go back to stable mode.
-		 */
-			if (is_bw_full)
-				vars->base_rate -= vars->rate_delta / 4;
-			arl_change_mode(q, ARL_STABLE);
+			/* If latency is no longer high or cannot be further
+			 * reduced, go back to stable state.
+			 */
+			if (is_under_load)
+				vars->base_rate -= (vars->base_rate >>
+						    ARL_SCALE);
+			arl_change_state(q, ARL_STABLE);
 			return;
 		}
 
-		/* If it is not just short minor term latency increases,
+		/* If it is not just short term minor latency increases,
 		 * then the pervious minor adjustment of rate is not sufficient.
 		 * The base_rate is likely exceed the available bandwidth, goto
 		 * DRAIN state.
 		 */
-		if (vars->bw_est > q->params.min_rate &&
-		    ((minmax_get(&q->vars.min_hrtt) > q->params.max_latency) ||
-		    ((minmax_get(&q->vars.st_min_hrtt) >
-		    q->params.max_latency) && vars->cycle_cnt > 2))) {
-			arl_change_mode(q, ARL_DRAIN);
+		if (vars->bw_est > q->params.min_rate && is_latency_current &&
+		    (minmax_get(&q->vars.st_min_hrtt) > q->params.max_latency &&
+		     vars->cycle_cnt > 2)) {
+			arl_change_state(q, ARL_DRAIN);
 			return;
 		}
 
@@ -402,31 +567,38 @@ static void arl_update_phase(struct arl_sched_data *q)
 		else
 			vars->rate_factor = ARL_BW_UNIT;
 
+		// Increase rate adjustment for each cycle
 		vars->rate_delta = ((vars->rate_delta * vars->rate_factor)
-					>> ARL_SCALE);
+				    >> ARL_SCALE);
 		if (vars->rate_delta > vars->base_rate / 4)
 			vars->rate_delta = vars->base_rate / 4;
 		break;
 
 	case ARL_DRAIN:
 		if (!is_latency_high || vars->bw_est < q->params.min_rate) {
-			arl_change_mode(q, ARL_STABLE);
+			arl_change_state(q, ARL_STABLE);
 			return;
 		}
-		arl_change_mode(q, ARL_LATENCY_PROBE);
+		arl_change_state(q, ARL_LATENCY_PROBE);
 		return;
 
 	case ARL_UNTHROTTLED:
-		if (is_latency_high) {
-			arl_change_mode(q, ARL_LATENCY_PROBE);
+		if (minmax_get(&vars->max_bw) > q->params.max_bw ||
+		    vars->bw_est < q->params.min_rate)
+			break;
+
+		if (is_latency_high || vars->latency_trend > 1) {
+			if (vars->bw_est > vars->base_rate) {
+				arl_change_state(q, ARL_LATENCY_PROBE);
+				return;
+			}
+			arl_change_state(q, ARL_STABLE);
 			return;
-		} else if ((vars->latency_trend > 1) ||
-			   ((minmax_get(&vars->max_bw) < q->params.max_bw) &&
-			   (vars->cycle_cnt > 10)))  {
-			if (vars->latency_trend >= 2 && is_bw_full)
-				arl_change_mode(q, ARL_LATENCY_PROBE);
-			else
-				arl_change_mode(q, ARL_STABLE);
+		}
+
+		if (vars->bw_est > vars->base_rate &&
+		    (!is_latency_current || vars->cycle_cnt > 10)) {
+			arl_change_state(q, ARL_STABLE);
 			return;
 		}
 		break;
@@ -435,12 +607,12 @@ static void arl_update_phase(struct arl_sched_data *q)
 	/* state unchanged */
 	vars->cycle_cnt++;
 	vars->min_hrtt_last_cycle = minmax_get(&vars->st_min_hrtt);
-	vars->latency_trend = 0;
+	if (q->params.mode == ARL_EGRESS)
+		vars->latency_trend = 0;
 	if (vars->base_rate < q->stats.min_rate || q->stats.min_rate == 0)
 		q->stats.min_rate = vars->base_rate;
-	next_rate = vars->rate_delta * arl_rate_tbl[vars->mode][vars->phase]
-		    + vars->base_rate;
-
+	next_rate = vars->rate_delta * arl_rate_tbl[vars->state][vars->phase]
+		    + vars->current_rate;
 	arl_apply_new_rate(q, next_rate);
 }
 
@@ -452,50 +624,58 @@ static void arl_update(struct Qdisc *sch)
 	    q->vars.phase_dur)
 		return;
 
-	arl_update_phase(q);
+	arl_update_phase(sch);
 }
 
 static void arl_params_init(struct arl_params *params)
 {
-	params->max_size = 5000;
+	params->max_size = 1600;
 	params->buffer = ARL_BUFFER_SIZE_DEFAULT * NSEC_PER_USEC;
 	params->max_bw = ARL_MAX_BW_DEFAULT;
 	params->min_rate = ARL_MIN_RATE_DEFAULT;
 	params->limit = 1000;
 	params->max_latency = ARL_MAX_LATENCY_DEFAULT;
 	params->latency_hysteresis = ARL_LAT_HYSTERESIS_DEFAULT;
+	params->mode = ARL_EGRESS;
+	params->target = 10000;
 }
 
-static	void arl_vars_init(struct arl_sched_data *q)
+static void arl_vars_init(struct arl_sched_data *q)
 {
 	struct arl_vars *vars = &q->vars;
 
 	vars->ts = ktime_get_ns();
-	q->vars.last_drain_t = ktime_get();
-	minmax_reset(&vars->lt_min_hrtt, jiffies, 5 * 1000);
-	minmax_reset(&vars->st_min_hrtt, jiffies, 5 * 1000);
+	vars->last_drain_t = ktime_get();
+	minmax_reset(&vars->lt_min_hrtt, jiffies, 5 * MSEC_PER_SEC);
+	minmax_reset(&vars->st_min_hrtt, jiffies, 5 * MSEC_PER_SEC);
 	minmax_reset(&vars->max_bw, jiffies, 0);
 	ewma_init(&vars->bw_avg, 8, 8);
 	vars->cfg_rate.linklayer = TC_LINKLAYER_ETHERNET;
 	vars->base_rate = q->params.rate;
-	vars->tokens = q->vars.buffer;
+	vars->current_rate = vars->base_rate;
+	vars->target_rate = vars->base_rate;
+	vars->tokens = q->params.buffer;
 	vars->buffer = q->params.buffer;
-	arl_bw_est_reset(q);
-	arl_change_mode(q, ARL_STABLE);
+	vars->next_bw_probe_t = jiffies;
+	vars->last_latency_upd_t = jiffies;
+	arl_bw_estimate_reset(q);
+	arl_change_state(q, ARL_BW_PROBE);
 }
 
 static void arl_update_latency_ct(struct arl_sched_data *q,
 				  struct  tcp_latency_sample *lat, u32 latency)
 {
-	u32	s_hrtt, hrtt_last = lat->s_hrtt_us;
+	u32 s_hrtt, duration, s_hrtt_last = lat->s_hrtt_us;
 
-	if (hrtt_last > ARL_LATENCY_SAMPLE_TIMEOUT_US ||
-	    latency > ARL_LATENCY_SAMPLE_TIMEOUT_US)
-		hrtt_last = latency;
+	if (latency > ARL_LATENCY_SAMPLE_TIMEOUT_US)
+		return;
+
+	if (s_hrtt_last > ARL_LATENCY_SAMPLE_TIMEOUT_US)
+		s_hrtt_last = latency;
 
 	/* s_hrtt_us = 3/4 old s_hrtt_us + 1/4 new sample */
-	if (hrtt_last)
-		s_hrtt = hrtt_last * 4 + latency - hrtt_last;
+	if (s_hrtt_last)
+		s_hrtt = s_hrtt_last * 4 + latency - s_hrtt_last;
 	else
 		s_hrtt = latency * 4;
 
@@ -504,26 +684,39 @@ static void arl_update_latency_ct(struct arl_sched_data *q,
 		s_hrtt = latency;
 	lat->s_hrtt_us = s_hrtt;
 
-	minmax_running_min(&q->vars.st_min_hrtt,
-			   (msecs_to_jiffies(q->vars.phase_dur)), jiffies,
-			   latency);
+	/* Ingess mode (downstream traffic) has fewer latency samples */
+	if (q->params.mode == ARL_INGRESS)
+		duration = q->vars.phase_dur * 4;
+	else
+		duration = q->vars.phase_dur;
+
+	minmax_running_min(&q->vars.st_min_hrtt, msecs_to_jiffies(duration),
+			   jiffies, latency);
 	minmax_running_min(&q->vars.min_hrtt, msecs_to_jiffies(ARL_MT_WIN),
 			   jiffies, s_hrtt);
 	minmax_running_min(&q->vars.lt_min_hrtt, msecs_to_jiffies(ARL_LT_WIN),
 			   jiffies, s_hrtt);
-	q->vars.last_latency_upd = jiffies;
+	q->vars.last_latency_upd_t = jiffies;
 }
 
 static void arl_update_latency(struct arl_sched_data *q, u32 latency)
 {
+	u32 duration;
+
+	/* Ingess mode (downstream traffic) has fewer latency samples */
+	if (q->params.mode == ARL_INGRESS)
+		duration = q->vars.phase_dur * 4;
+	else
+		duration = q->vars.phase_dur;
+
 	minmax_running_min(&q->vars.st_min_hrtt,
-			   (msecs_to_jiffies(q->vars.phase_dur)), jiffies,
+			   (msecs_to_jiffies(duration)), jiffies,
 			   latency);
 	minmax_running_min(&q->vars.min_hrtt, msecs_to_jiffies(ARL_MT_WIN),
 			   jiffies, latency);
 	minmax_running_min(&q->vars.lt_min_hrtt, msecs_to_jiffies(ARL_LT_WIN),
 			   jiffies, latency);
-	q->vars.last_latency_upd = jiffies;
+	q->vars.last_latency_upd_t = jiffies;
 }
 
 /* Latency measurement related utilities.
@@ -542,7 +735,7 @@ static void arl_update_latency(struct arl_sched_data *q, u32 latency)
 static void arl_egress_mark_pkt(struct sk_buff *skb, u32 seq,
 				struct nf_conn *ct)
 {
-	struct	tcp_latency_sample *tcp_lat;
+	struct tcp_latency_sample *tcp_lat;
 	ktime_t	now;
 
 	NF_CT_ASSERT(ct->timeout.data == (unsigned long)ct);
@@ -614,15 +807,13 @@ static struct tcphdr *arl_get_tcp_header_ipv6(struct sk_buff *skb,
 /* Find the conntrack entry for packet that takes the shortcut path and has no
  * ct entry set in its skb.
  */
-struct  nf_conn *arl_egress_find_ct_v4(struct sk_buff *skb, struct iphdr *iph,
-				       struct tcphdr *tcph)
+static struct nf_conn *arl_egress_find_ct_v4(struct sk_buff *skb,
+					     struct iphdr *iph,
+					     struct tcphdr *tcph)
 {
-	struct	nf_conntrack_tuple_hash *h;
-	struct	nf_conntrack_tuple tuple;
-	struct	nf_conn *ct = NULL;
-
-	if (!arl_latency_sampling_enanbled)
-		return ct;
+	struct nf_conntrack_tuple_hash *h;
+	struct nf_conntrack_tuple tuple;
+	struct nf_conn *ct = NULL;
 
 	/* construct a tuple to lookup nf_conn. */
 	memset(&tuple, 0, sizeof(tuple));
@@ -647,16 +838,13 @@ struct  nf_conn *arl_egress_find_ct_v4(struct sk_buff *skb, struct iphdr *iph,
 	return ct;
 }
 
-struct  nf_conn *arl_egress_find_ct_v6(struct sk_buff *skb,
-				       struct ipv6hdr *ipv6h,
-				       struct tcphdr *tcph)
+static struct nf_conn *arl_egress_find_ct_v6(struct sk_buff *skb,
+					     struct ipv6hdr *ipv6h,
+					     struct tcphdr *tcph)
 {
-	struct	nf_conntrack_tuple_hash *h;
-	struct	nf_conntrack_tuple tuple;
-	struct	nf_conn *ct = NULL;
-
-	if (!arl_latency_sampling_enanbled)
-		return ct;
+	struct nf_conntrack_tuple_hash *h;
+	struct nf_conntrack_tuple tuple;
+	struct nf_conn *ct = NULL;
 
 	/* construct a tuple to lookup nf_conn. */
 	memset(&tuple, 0, sizeof(tuple));
@@ -679,21 +867,22 @@ struct  nf_conn *arl_egress_find_ct_v6(struct sk_buff *skb,
 	return ct;
 }
 
-static void arl_latency_sample_egress(struct arl_sched_data *q,
+static void arl_sample_latency_egress(struct arl_sched_data *q,
 				      struct sk_buff *skb)
 {
-	struct	tcphdr *tcph, tcphdr;
-	struct	nf_conn *ct;
-	struct	tcp_latency_sample *tcp_lat;
-	u32	latency_sampling;
+	struct tcphdr *tcph, tcphdr;
+	struct nf_conn *ct;
 	struct iphdr *iph;
 	struct ipv6hdr *ipv6h;
+	struct tcp_latency_sample *tcp_lat;
+	u32 latency_sampling;
+	u32 latency = 0;
 
-	if (!arl_latency_sampling_enanbled)
+	if (!arl_latency_sampling_enabled)
 		return;
 
 	/* skip small packets */
-	if (!skb || skb->len < 256)
+	if (!skb || skb->len < 54)
 		return;
 
 	/* Skip bc/mc packets. */
@@ -730,7 +919,7 @@ static void arl_latency_sample_egress(struct arl_sched_data *q,
 	latency_sampling = atomic_read(&tcp_lat->sampling_state);
 
 	if (unlikely(latency_sampling == ARL_SAMPLE_STATE_DONE)) {
-		u32 latency = tcp_lat->last_hrtt;
+		latency = tcp_lat->last_hrtt;
 
 		if (atomic_cmpxchg(&tcp_lat->sampling_state,
 				   ARL_SAMPLE_STATE_DONE,
@@ -743,27 +932,45 @@ static void arl_latency_sample_egress(struct arl_sched_data *q,
 		}
 		atomic_set(&tcp_lat->sampling_state,
 			   ARL_SAMPLE_STATE_IDLE);
+	} else if (latency_sampling == ARL_SAMPLE_STATE_SAMPLING) {
+		ktime_t	send_ts;
+
+		send_ts.tv64 = tcp_lat->send_ts;
+		if (ktime_us_delta(ktime_get(), send_ts) <
+		    ARL_LATENCY_SAMPLE_TIMEOUT_US)
+			goto exit;
+
+		if (atomic_cmpxchg(&tcp_lat->sampling_state,
+				   ARL_SAMPLE_STATE_SAMPLING,
+				   ARL_SAMPLE_STATE_IDLE) !=
+		    ARL_SAMPLE_STATE_SAMPLING)
+			goto exit;
 	} else if (latency_sampling > ARL_SAMPLE_STATE_IDLE) {
 		goto exit;
 	}
+
+	/* Check if it should start sampling for latency again */
+	if (ntohl(tcph->seq) == tcp_lat->last_seq)
+		goto exit;
 
 	if (atomic_cmpxchg(&tcp_lat->sampling_state, ARL_SAMPLE_STATE_IDLE,
 			   ARL_SAMPLE_STATE_UPDATING) != ARL_SAMPLE_STATE_IDLE)
 		goto exit;
 
+	arl_egress_mark_pkt(skb, ntohl(tcph->seq), ct);
 	atomic_set(&tcp_lat->sampling_state,
 		   ARL_SAMPLE_STATE_SAMPLING);
-	arl_egress_mark_pkt(skb, ntohl(tcph->seq), ct);
 
 exit:
 	nf_ct_put(ct);
 }
 
-/* Extract half round trip time from routed TCP packets
- * Return hrtt in us if successful, return -1 otherwise.
+/* Extract half path round trip time measured from routed TCP packets.
+ * Return 0 if successful, return -1 otherwise.
  */
-static int  arl_get_hrtt(struct sk_buff *skb, u32 ack_seq,
-			 struct  tcp_latency_sample *tcp_lat)
+static int arl_update_hrtt(struct arl_sched_data *q, struct sk_buff *skb,
+			   u32 ack_seq,
+			   struct tcp_latency_sample *tcp_lat)
 {
 	s64	time_delta;
 	ktime_t	sent_ts;
@@ -786,24 +993,26 @@ static int  arl_get_hrtt(struct sk_buff *skb, u32 ack_seq,
 		return -1;
 
 	tcp_lat->last_hrtt = time_delta;
+	arl_update_latency_ct(q, tcp_lat, time_delta);
 	atomic_set(&tcp_lat->sampling_state,
 		   ARL_SAMPLE_STATE_DONE);
 	return 0;
 }
 
-void arl_latency_sample_ingress_v4(struct sk_buff *skb,
-				   struct iphdr *iph,
-				   struct tcphdr *tcph)
+static void arl_sample_latency_ingress_v4(struct arl_sched_data *q,
+					  struct sk_buff *skb,
+					  struct iphdr *iph,
+					  struct tcphdr *tcph)
 {
-	struct	nf_conn *ct;
-	struct  nf_conntrack_tuple tuple;
-	struct  nf_conntrack_tuple_hash *h;
-	struct  tcp_latency_sample *tcp_lat;
+	struct nf_conn *ct;
+	struct nf_conntrack_tuple tuple;
+	struct nf_conntrack_tuple_hash *h;
+	struct tcp_latency_sample *tcp_lat;
 
-	if (!skb || !skb->dev || skb->dev->ifindex != arl_dev_index)
+	if (!skb || !skb->dev)
 		return;
 
-	if (!arl_latency_sampling_enanbled)
+	if (!arl_latency_sampling_enabled)
 		return;
 
 	/* construct a tuple to lookup nf_conn. */
@@ -832,27 +1041,27 @@ void arl_latency_sample_ingress_v4(struct sk_buff *skb,
 	if (atomic_read(&tcp_lat->sampling_state) != ARL_SAMPLE_STATE_SAMPLING)
 		goto exit;
 
-	if (arl_get_hrtt(skb, ntohl(tcph->ack_seq), tcp_lat))
+	if (arl_update_hrtt(q, skb, ntohl(tcph->ack_seq), tcp_lat))
 		goto exit;
 
 exit:
 	nf_ct_put(ct);
 }
-EXPORT_SYMBOL(arl_latency_sample_ingress_v4);
 
-void arl_latency_sample_ingress_v6(struct sk_buff *skb, struct ipv6hdr *ipv6h,
-				   struct tcphdr *tcph)
-
+static void arl_sample_latency_ingress_v6(struct arl_sched_data *q,
+					  struct sk_buff *skb,
+					  struct ipv6hdr *ipv6h,
+					  struct tcphdr *tcph)
 {
-	struct	nf_conn *ct;
-	struct  nf_conntrack_tuple tuple;
-	struct  nf_conntrack_tuple_hash *h;
-	struct  tcp_latency_sample *tcp_lat;
+	struct nf_conn *ct;
+	struct nf_conntrack_tuple tuple;
+	struct nf_conntrack_tuple_hash *h;
+	struct tcp_latency_sample *tcp_lat;
 
-	if (!skb || !skb->dev || skb->dev->ifindex != arl_dev_index)
+	if (!skb || !skb->dev)
 		return;
 
-	if (!arl_latency_sampling_enanbled)
+	if (!arl_latency_sampling_enabled)
 		return;
 
 	/* construct a tuple to lookup nf_conn. */
@@ -880,15 +1089,15 @@ void arl_latency_sample_ingress_v6(struct sk_buff *skb, struct ipv6hdr *ipv6h,
 	if (atomic_read(&tcp_lat->sampling_state) != ARL_SAMPLE_STATE_SAMPLING)
 		goto exit;
 
-	if (arl_get_hrtt(skb, ntohl(tcph->ack_seq), tcp_lat))
+	if (arl_update_hrtt(q, skb, ntohl(tcph->ack_seq), tcp_lat))
 		goto exit;
 
 exit:
 	nf_ct_put(ct);
 }
-EXPORT_SYMBOL(arl_latency_sample_ingress_v6);
 
-void arl_latency_sample_ingress(struct sk_buff *skb)
+static void arl_sample_latency_ingress(struct arl_sched_data *q,
+				       struct sk_buff *skb)
 {
 	struct iphdr *iph;
 	struct ipv6hdr *ipv6h;
@@ -898,15 +1107,46 @@ void arl_latency_sample_ingress(struct sk_buff *skb)
 		tcph = arl_get_tcp_header_ipv4(skb, &tcphdr);
 		if (!tcph)
 			return;
-		arl_latency_sample_ingress_v4(skb, iph, tcph);
+		arl_sample_latency_ingress_v4(q, skb, iph, tcph);
 	} else if (htons(ETH_P_IPV6) == skb->protocol) {
 		tcph = arl_get_tcp_header_ipv6(skb, &tcphdr);
 		if (!tcph)
 			return;
-		arl_latency_sample_ingress_v6(skb, ipv6h, tcph);
+		arl_sample_latency_ingress_v6(q, skb, ipv6h, tcph);
 	}
 }
-EXPORT_SYMBOL(arl_latency_sample_ingress);
+
+static void arl_dequeue_update(struct Qdisc *sch, struct sk_buff *skb)
+{
+	struct arl_sched_data *q = qdisc_priv(sch);
+
+	qdisc_qstats_backlog_dec(sch, skb);
+	if (WARN_ONCE(sch->qstats.backlog > INT_MAX,
+		      "backlog underflow %d %d\n", sch->qstats.backlog,
+		      qdisc_pkt_len(skb)))
+		sch->qstats.backlog = 0;
+	sch->q.qlen--;
+	qdisc_bstats_update(sch, skb);
+
+	if (q->params.mode != ARL_EGRESS)
+		return;
+
+	q->vars.bw_est_bytes_sent += qdisc_pkt_len(skb);
+	arl_sample_latency_egress(q, skb);
+}
+
+static void arl_enqueue_update(struct Qdisc *sch, unsigned int len)
+{
+	struct arl_sched_data *q = qdisc_priv(sch);
+
+	sch->qstats.backlog += len;
+	sch->q.qlen++;
+
+	if (q->params.mode != ARL_INGRESS)
+		return;
+
+	q->vars.bw_est_bytes_sent += len;
+}
 
 /* GSO packets maybe too big and takes more than maxmium tokens to transmit.
  * Segment the GSO packets that is larger than max_size.
@@ -917,6 +1157,7 @@ static int gso_segment(struct sk_buff *skb, struct Qdisc *sch)
 	struct arl_sched_data *q = qdisc_priv(sch);
 	struct sk_buff *segs, *nskb;
 	netdev_features_t features = netif_skb_features(skb);
+	unsigned int len = 0;
 	int ret, nb;
 
 	segs = skb_gso_segment(skb, features & ~NETIF_F_GSO_MASK);
@@ -929,6 +1170,7 @@ static int gso_segment(struct sk_buff *skb, struct Qdisc *sch)
 		nskb = segs->next;
 		segs->next = NULL;
 		qdisc_skb_cb(segs)->pkt_len = segs->len;
+		len += segs->len;
 		ret = qdisc_enqueue(segs, q->qdisc);
 		if (ret != NET_XMIT_SUCCESS) {
 			if (net_xmit_drop_count(ret))
@@ -941,6 +1183,7 @@ static int gso_segment(struct sk_buff *skb, struct Qdisc *sch)
 	sch->q.qlen += nb;
 	if (nb > 1)
 		qdisc_tree_decrease_qlen(sch, 1 - nb);
+	sch->qstats.backlog += len;
 	consume_skb(skb);
 
 	return nb > 0 ? NET_XMIT_SUCCESS : NET_XMIT_DROP;
@@ -949,6 +1192,7 @@ static int gso_segment(struct sk_buff *skb, struct Qdisc *sch)
 static int arl_enqueue(struct sk_buff *skb, struct Qdisc *sch)
 {
 	struct arl_sched_data *q = qdisc_priv(sch);
+	unsigned int len = qdisc_pkt_len(skb);
 	int ret;
 
 	if (qdisc_pkt_len(skb) > q->params.max_size) {
@@ -963,6 +1207,9 @@ static int arl_enqueue(struct sk_buff *skb, struct Qdisc *sch)
 			qdisc_qstats_drop(sch);
 		return ret;
 	}
+	if (q->params.mode == ARL_INGRESS)
+		arl_sample_latency_ingress(q, skb);
+	arl_enqueue_update(sch, len);
 	return NET_XMIT_SUCCESS;
 }
 
@@ -994,29 +1241,26 @@ static struct sk_buff *arl_dequeue(struct Qdisc *sch)
 		s64 toks;
 		unsigned int len = qdisc_pkt_len(skb);
 
-		if (len > q->params.max_size) {
-			pr_err("%s: Oversized pkt! %u Bytes, max:%u\n",
-			       __func__, len, q->params.max_size);
+		if (WARN_ONCE(len > q->params.max_size,
+			      "Oversized pkt! %u Bytes, max:%u\n", len,
+			      q->params.max_size))
 			len = q->params.max_size - 1;
-		}
 
-		if (q->vars.mode == ARL_UNTHROTTLED) {
+		if (q->vars.state == ARL_UNTHROTTLED) {
 			skb = qdisc_dequeue_peeked(q->qdisc);
 			if (unlikely(!skb))
 				return NULL;
-			qdisc_bstats_update(sch, skb);
-			q->vars.bw_est_bytes_sent += len;
-			arl_latency_sample_egress(q, skb);
+			arl_dequeue_update(sch, skb);
 			return skb;
 		}
 
 		now = ktime_get_ns();
-		toks = min(now - q->vars.ts, q->vars.buffer);
+		toks = min_t(s64, now - q->vars.ts, q->vars.buffer);
 
 		toks += q->vars.tokens;
 		if (toks > q->vars.buffer)
 			toks = q->vars.buffer;
-		toks -= psched_l2t_ns(&q->vars.rate, len);
+		toks -= (s64)psched_l2t_ns(&q->vars.rate, len);
 
 		if (toks >= 0) {
 			skb = qdisc_dequeue_peeked(q->qdisc);
@@ -1025,14 +1269,10 @@ static struct sk_buff *arl_dequeue(struct Qdisc *sch)
 
 			q->vars.ts = now;
 			q->vars.tokens = toks;
-			qdisc_unthrottled(sch);
-			qdisc_bstats_update(sch, skb);
-			q->vars.bw_est_bytes_sent += len;
-			arl_latency_sample_egress(q, skb);
+			arl_dequeue_update(sch, skb);
 			return skb;
 		}
 		qdisc_watchdog_schedule_ns(&q->wtd, now + (-toks), true);
-
 		qdisc_qstats_overlimit(sch);
 	}
 	return NULL;
@@ -1055,6 +1295,8 @@ static const struct nla_policy arl_policy[TCA_ARL_MAX + 1] = {
 	[TCA_ARL_LIMIT]		= { .type = NLA_U32 },
 	[TCA_ARL_MAX_LATENCY]	= { .type = NLA_U32 },
 	[TCA_ARL_LATENCY_HYSTERESIS]	= { .type = NLA_U32 },
+	[TCA_ARL_MODE]		= { .type = NLA_U32 },
+	[TCA_ARL_CODEL_TARGET]	= { .type = NLA_U32 },
 };
 
 static int arl_change(struct Qdisc *sch, struct nlattr *opt)
@@ -1074,15 +1316,20 @@ static int arl_change(struct Qdisc *sch, struct nlattr *opt)
 		q->params.buffer = nla_get_u32(tb[TCA_ARL_BUFFER])
 				   * NSEC_PER_USEC;
 
+	/* convert the max_bw to KBps */
 	if (tb[TCA_ARL_MAX_BW])
-		q->params.max_bw = nla_get_u64(tb[TCA_ARL_MAX_BW]);
+		q->params.max_bw = div_u64(nla_get_u64(tb[TCA_ARL_MAX_BW]),
+					   1000);
 
 	if (tb[TCA_ARL_MIN_RATE])
 		q->params.min_rate = div_u64(nla_get_u64(tb[TCA_ARL_MIN_RATE]),
 					     1000);
 
-	/* Start ARL with min_rate * 2 */
-	q->params.rate = q->params.min_rate * 2;
+	if (tb[TCA_ARL_MODE])
+		q->params.mode = nla_get_u32(tb[TCA_ARL_MODE]);
+
+	/* Start ARL with 120% of min_rate */
+	q->params.rate = div_u64(q->params.min_rate * 120, 100);
 
 	if (tb[TCA_ARL_LIMIT])
 		q->params.limit = nla_get_u32(tb[TCA_ARL_LIMIT]);
@@ -1094,6 +1341,9 @@ static int arl_change(struct Qdisc *sch, struct nlattr *opt)
 			nla_get_u32(tb[TCA_ARL_LATENCY_HYSTERESIS]);
 	if (q->params.max_latency < ARL_MAX_LATENCY_DEFAULT / 2)
 		q->params.max_latency = ARL_MAX_LATENCY_DEFAULT;
+
+	if (tb[TCA_ARL_CODEL_TARGET])
+		q->params.target = nla_get_u32(tb[TCA_ARL_CODEL_TARGET]);
 
 	arl_vars_init(q);
 	memset(&rate_conf, 0, sizeof(rate_conf));
@@ -1143,28 +1393,23 @@ static u32 arl_get_rtt_from_sk(struct sock *sk)
 	return rtt;
 }
 
-u32 arl_get_rtt(struct Qdisc *sch)
+static u32 arl_get_rtt(struct Qdisc *sch)
 {
 	int i;
 	struct inet_hashinfo *hashinfo = &tcp_hashinfo;
 	u32 rtt, rtt_min = U32_MAX;
-	struct net_device *dev = qdisc_dev(sch);
 
 	for (i = 0; i <= hashinfo->ehash_mask; i++) {
 		struct inet_ehash_bucket *head = &hashinfo->ehash[i];
-		spinlock_t *lock = inet_ehash_lockp(hashinfo, i);
 		struct sock *sk;
 		struct hlist_nulls_node *node;
 
-		if (hlist_nulls_empty(&head->chain))
-			continue;
-
-		spin_lock_bh(lock);
-		sk_nulls_for_each(sk, node, &head->chain) {
+		rcu_read_lock();
+		sk_nulls_for_each_rcu(sk, node, &head->chain) {
 			if (sk->sk_family != AF_INET && sk->sk_family !=
 			    AF_INET6)
 				continue;
-			if (inet_sk(sk)->rx_dst_ifindex !=  dev->ifindex)
+			if (inet_sk(sk)->rx_dst_ifindex != arl_dev_index)
 				continue;
 			rtt = arl_get_rtt_from_sk(sk);
 			if (rtt == U32_MAX)
@@ -1173,7 +1418,7 @@ u32 arl_get_rtt(struct Qdisc *sch)
 			if (rtt < rtt_min)
 				rtt_min = rtt;
 		}
-		spin_unlock_bh(lock);
+		rcu_read_unlock();
 	}
 	return rtt_min;
 }
@@ -1196,8 +1441,6 @@ static int arl_init(struct Qdisc *sch, struct nlattr *opt)
 	struct arl_sched_data *q = qdisc_priv(sch);
 	struct net_device *dev = qdisc_dev(sch);
 
-	arl_dev_index = dev->ifindex;
-
 	arl_params_init(&q->params);
 	qdisc_watchdog_init(&q->wtd, sch);
 	q->qdisc = &noop_qdisc;
@@ -1214,7 +1457,9 @@ static int arl_init(struct Qdisc *sch, struct nlattr *opt)
 		if (err)
 			return err;
 	}
-	arl_latency_sampling_enanbled = true;
+	arl_latency_sampling_enabled = true;
+	if (q->params.mode == ARL_EGRESS)
+		arl_dev_index = dev->ifindex;
 
 	return 0;
 }
@@ -1223,7 +1468,8 @@ static void arl_destroy(struct Qdisc *sch)
 {
 	struct arl_sched_data *q = qdisc_priv(sch);
 
-	arl_dev_index = -1;
+	if (q->params.mode == ARL_EGRESS)
+		arl_dev_index = -1;
 	qdisc_watchdog_cancel(&q->wtd);
 	del_timer_sync(&q->arl_timer);
 	qdisc_destroy(q->qdisc);
@@ -1242,9 +1488,12 @@ static int arl_dump(struct Qdisc *sch, struct sk_buff *skb)
 			 q->params.buffer / NSEC_PER_USEC)) ||
 	    (nla_put_u64(skb, TCA_ARL_MIN_RATE, q->params.min_rate * 1000)) ||
 	    (nla_put_u32(skb, TCA_ARL_LIMIT, q->params.limit)) ||
-	    (nla_put_u64(skb, TCA_ARL_MAX_BW, q->params.max_bw)) ||
+	    (nla_put_u64(skb, TCA_ARL_MAX_BW, q->params.max_bw)) * 1000 ||
+	    (nla_put_u32(skb, TCA_ARL_MODE, q->params.mode)) ||
 	    (nla_put_u32(skb, TCA_ARL_LATENCY_HYSTERESIS,
 			 q->params.latency_hysteresis)) ||
+	    (nla_put_u32(skb, TCA_ARL_CODEL_TARGET,
+			 q->params.target)) ||
 	    (nla_put_u32(skb, TCA_ARL_MAX_LATENCY, q->params.max_latency)))
 		goto nla_put_failure;
 
@@ -1271,11 +1520,14 @@ static int arl_dump_stats(struct Qdisc *sch, struct gnet_dump *d)
 	struct arl_sched_data *q = qdisc_priv(sch);
 	struct tc_arl_xstats st = { 0 };
 
-	/* convert bw and rate from KBps to Kbps */
+	/* convert bw and rate from KBps to Kbits */
 	st.max_bw = q->stats.max_bw * 8;
 	st.min_rate = q->stats.min_rate * 8;
-	st.current_rate = q->vars.base_rate * 8;
+	st.base_rate = q->vars.base_rate * 8;
+	st.current_rate = q->vars.current_rate * 8;
 	st.latency = minmax_get(&q->vars.min_hrtt);
+	st.state = q->vars.state;
+	st.current_bw = q->vars.bw_est * 8;
 
 	/* clear max_bw and min_rate after each stats dump */
 	q->stats.max_bw = 0;

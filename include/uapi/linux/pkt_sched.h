@@ -183,10 +183,13 @@ enum {
 
 /* ARL section */
 struct tc_arl_xstats {
-	__u32   max_bw;		/* The maxmium bw measured */
-	__u32   min_rate;	/* The lowest base rate */
-	__u32   current_rate;	/* The current base rate */
-	__u32   latency;	/* The current latency */
+	__u32	max_bw;		/* The maxmium bw measured */
+	__u32	min_rate;	/* The lowest base rate */
+	__u32	current_rate;	/* The current base rate */
+	__u32	latency;	/* The current latency */
+	__u32	base_rate;	/* The base rate */
+	__u32	current_bw;	/* The current bw measured */
+	__u32	state;		/* The current state */
 };
 
 enum {
@@ -197,6 +200,9 @@ enum {
 	TCA_ARL_LIMIT,
 	TCA_ARL_MAX_LATENCY,
 	TCA_ARL_LATENCY_HYSTERESIS,
+	TCA_ARL_PAD,
+	TCA_ARL_MODE,
+	TCA_ARL_CODEL_TARGET,
 	__TCA_ARL_MAX,
 };
 #define TCA_ARL_MAX (__TCA_ARL_MAX - 1)
