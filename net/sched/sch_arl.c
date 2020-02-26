@@ -1328,8 +1328,8 @@ static int arl_change(struct Qdisc *sch, struct nlattr *opt)
 	if (tb[TCA_ARL_MODE])
 		q->params.mode = nla_get_u32(tb[TCA_ARL_MODE]);
 
-	/* Start ARL with 120% of min_rate */
-	q->params.rate = div_u64(q->params.min_rate * 120, 100);
+	/* Start ARL with 125% of min_rate */
+	q->params.rate = div_u64(q->params.min_rate * 125, 100);
 
 	if (tb[TCA_ARL_LIMIT])
 		q->params.limit = nla_get_u32(tb[TCA_ARL_LIMIT]);
