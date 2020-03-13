@@ -1009,6 +1009,8 @@ static int mmc_sdio_resume(struct mmc_host *host)
 	return err;
 }
 
+#define SDIO_DEVICE_MVL_8897 0x912c
+
 static int mmc_sdio_power_restore(struct mmc_host *host)
 {
 	int ret;
@@ -1034,6 +1036,12 @@ static int mmc_sdio_power_restore(struct mmc_host *host)
 	 * harmless in other situations.
 	 *
 	 */
+
+	if (host->card->cis.vendor == SDIO_VENDOR_ID_MARVELL &&
+	    host->card->cis.device == SDIO_DEVICE_MVL_8897) {
+		// b/140272233
+		mmc_set_clock(host, host->f_min);
+	}
 
 	sdio_reset(host);
 	mmc_go_idle(host);
