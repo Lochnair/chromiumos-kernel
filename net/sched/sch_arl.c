@@ -808,15 +808,17 @@ static struct tcphdr *arl_get_tcp_header_ipv6(struct sk_buff *skb,
  * ct entry set in its skb.
  */
 static struct nf_conn *arl_egress_find_ct_v4(struct sk_buff *skb,
-					     struct iphdr *iph,
 					     struct tcphdr *tcph)
 {
+	struct iphdr *iph;
 	struct nf_conntrack_tuple_hash *h;
 	struct nf_conntrack_tuple tuple;
 	struct nf_conn *ct = NULL;
 
 	/* construct a tuple to lookup nf_conn. */
 	memset(&tuple, 0, sizeof(tuple));
+
+	iph = ip_hdr(skb);
 	tuple.dst.protonum = iph->protocol;
 
 	/* The routed packet is transfromed by NAPT, so use the CT entry from
@@ -839,19 +841,19 @@ static struct nf_conn *arl_egress_find_ct_v4(struct sk_buff *skb,
 }
 
 static struct nf_conn *arl_egress_find_ct_v6(struct sk_buff *skb,
-					     struct ipv6hdr *ipv6h,
 					     struct tcphdr *tcph)
 {
+	struct ipv6hdr *ipv6h;
 	struct nf_conntrack_tuple_hash *h;
 	struct nf_conntrack_tuple tuple;
 	struct nf_conn *ct = NULL;
 
 	/* construct a tuple to lookup nf_conn. */
 	memset(&tuple, 0, sizeof(tuple));
-
 	tuple.dst.dir = IP_CT_DIR_REPLY;
 	tuple.dst.protonum = IPPROTO_TCP;
 
+	ipv6h = ipv6_hdr(skb);
 	tuple.src.u3.in6 = ipv6h->daddr;
 	tuple.dst.u3.in6 = ipv6h->saddr;
 	tuple.src.l3num = AF_INET6;
@@ -872,8 +874,6 @@ static void arl_sample_latency_egress(struct arl_sched_data *q,
 {
 	struct tcphdr *tcph, tcphdr;
 	struct nf_conn *ct;
-	struct iphdr *iph;
-	struct ipv6hdr *ipv6h;
 	struct tcp_latency_sample *tcp_lat;
 	u32 latency_sampling;
 	u32 latency = 0;
@@ -892,17 +892,17 @@ static void arl_sample_latency_egress(struct arl_sched_data *q,
 
 	/* Only process TCP packets */
 	if (likely(htons(ETH_P_IP) == skb->protocol)) {
-		iph = ip_hdr(skb);
 		tcph = arl_get_tcp_header_ipv4(skb, &tcphdr);
 		if (!tcph)
 			return;
-		ct = arl_egress_find_ct_v4(skb, iph, tcph);
+		ct = arl_egress_find_ct_v4(skb, tcph);
 	} else if (likely(htons(ETH_P_IPV6) == skb->protocol)) {
-		ipv6h = ipv6_hdr(skb);
 		tcph = arl_get_tcp_header_ipv6(skb, &tcphdr);
 		if (!tcph)
 			return;
-		ct = arl_egress_find_ct_v6(skb, ipv6h, tcph);
+		ct = arl_egress_find_ct_v6(skb, tcph);
+	} else {
+		return;
 	}
 
 	if (unlikely(!ct))
@@ -1001,11 +1001,11 @@ static int arl_update_hrtt(struct arl_sched_data *q, struct sk_buff *skb,
 
 static void arl_sample_latency_ingress_v4(struct arl_sched_data *q,
 					  struct sk_buff *skb,
-					  struct iphdr *iph,
 					  struct tcphdr *tcph)
 {
 	struct nf_conn *ct;
 	struct nf_conntrack_tuple tuple;
+	struct iphdr *iph;
 	struct nf_conntrack_tuple_hash *h;
 	struct tcp_latency_sample *tcp_lat;
 
@@ -1050,11 +1050,11 @@ exit:
 
 static void arl_sample_latency_ingress_v6(struct arl_sched_data *q,
 					  struct sk_buff *skb,
-					  struct ipv6hdr *ipv6h,
 					  struct tcphdr *tcph)
 {
 	struct nf_conn *ct;
 	struct nf_conntrack_tuple tuple;
+	struct ipv6hdr *ipv6h;
 	struct nf_conntrack_tuple_hash *h;
 	struct tcp_latency_sample *tcp_lat;
 
@@ -1069,6 +1069,7 @@ static void arl_sample_latency_ingress_v6(struct arl_sched_data *q,
 	tuple.dst.dir = IP_CT_DIR_REPLY;
 	tuple.dst.protonum = IPPROTO_TCP;
 
+	ipv6h = ipv6_hdr(skb);
 	tuple.src.u3.in6 = ipv6h->saddr;
 	tuple.dst.u3.in6 = ipv6h->daddr;
 	tuple.src.l3num = AF_INET6;
@@ -1099,20 +1100,18 @@ exit:
 static void arl_sample_latency_ingress(struct arl_sched_data *q,
 				       struct sk_buff *skb)
 {
-	struct iphdr *iph;
-	struct ipv6hdr *ipv6h;
 	struct tcphdr *tcph, tcphdr;
 
 	if (htons(ETH_P_IP) == skb->protocol) {
 		tcph = arl_get_tcp_header_ipv4(skb, &tcphdr);
 		if (!tcph)
 			return;
-		arl_sample_latency_ingress_v4(q, skb, iph, tcph);
+		arl_sample_latency_ingress_v4(q, skb, tcph);
 	} else if (htons(ETH_P_IPV6) == skb->protocol) {
 		tcph = arl_get_tcp_header_ipv6(skb, &tcphdr);
 		if (!tcph)
 			return;
-		arl_sample_latency_ingress_v6(q, skb, ipv6h, tcph);
+		arl_sample_latency_ingress_v6(q, skb, tcph);
 	}
 }
 
