@@ -2775,13 +2775,6 @@ static int btusb_bcm_set_diag(struct hci_dev *hdev, bool enable)
 }
 #endif
 
-static bool btusb_prevent_wake(struct hci_dev *hdev)
-{
-	struct btusb_data *data = hci_get_drvdata(hdev);
-
-	return !device_may_wakeup(&data->udev->dev);
-}
-
 static int btusb_probe(struct usb_interface *intf,
 		       const struct usb_device_id *id)
 {
@@ -2902,7 +2895,6 @@ static int btusb_probe(struct usb_interface *intf,
 	hdev->flush  = btusb_flush;
 	hdev->send   = btusb_send_frame;
 	hdev->notify = btusb_notify;
-	hdev->prevent_wake = btusb_prevent_wake;
 
 	if (id->driver_info & BTUSB_CW6622)
 		set_bit(HCI_QUIRK_BROKEN_STORED_LINK_KEY, &hdev->quirks);
