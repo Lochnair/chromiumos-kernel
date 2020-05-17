@@ -172,8 +172,12 @@ static int cros_ec_sensors_write(struct iio_dev *indio_dev,
 		/* Always roundup, so caller gets at least what it asks for. */
 		st->core.param.sensor_range.roundup = 1;
 
-		if (cros_ec_motion_send_host_cmd(&st->core, 0))
+		if (cros_ec_motion_send_host_cmd(&st->core, 0)) {
 			ret = -EIO;
+		} else {
+			st->core.range_updated = true;
+			st->core.curr_range = val;
+		}
 		break;
 	default:
 		ret = cros_ec_sensors_core_write(

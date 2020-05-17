@@ -148,9 +148,12 @@ static int cros_ec_light_prox_write(struct iio_dev *indio_dev,
 		break;
 	case IIO_CHAN_INFO_CALIBSCALE:
 		st->core.param.cmd = MOTIONSENSE_CMD_SENSOR_RANGE;
-		st->core.param.sensor_range.data = (val << 16) | (val2 / 100);
+		st->core.curr_range = (val << 16) | (val2 / 100);
+		st->core.param.sensor_range.data = st->core.curr_range;
 		if (cros_ec_motion_send_host_cmd(&st->core, 0))
 			ret = -EIO;
+		else
+			st->core.range_updated = true;
 		break;
 	default:
 		ret = cros_ec_sensors_core_write(

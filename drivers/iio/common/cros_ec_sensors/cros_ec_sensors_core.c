@@ -633,13 +633,20 @@ static void __maybe_unused cros_ec_sensors_complete(struct device *dev)
 	struct iio_dev *indio_dev = platform_get_drvdata(pdev);
 	struct cros_ec_sensors_core_state *st = iio_priv(indio_dev);
 
-	if (st->curr_sampl_freq == 0)
-		return;
-
-	if (st->curr_sampl_freq < CROS_EC_MIN_SUSPEND_SAMPLING_FREQUENCY) {
+	if (st->curr_sampl_freq > 0 &&
+	    st->curr_sampl_freq < CROS_EC_MIN_SUSPEND_SAMPLING_FREQUENCY) {
 		mutex_lock(&st->cmd_lock);
 		st->param.cmd = MOTIONSENSE_CMD_EC_RATE;
 		st->param.ec_rate.data = st->curr_sampl_freq;
+		cros_ec_motion_send_host_cmd(st, 0);
+		mutex_unlock(&st->cmd_lock);
+	}
+
+	if (st->range_updated) {
+		mutex_lock(&st->cmd_lock);
+		st->param.cmd = MOTIONSENSE_CMD_SENSOR_RANGE;
+		st->param.sensor_range.data = st->curr_range;
+		st->param.sensor_range.roundup = 1;
 		cros_ec_motion_send_host_cmd(st, 0);
 		mutex_unlock(&st->cmd_lock);
 	}
