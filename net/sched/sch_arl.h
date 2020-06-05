@@ -16,7 +16,9 @@ enum arl_state {
 	 */
 	ARL_LATENCY_PROBE,
 	/* UNTHROTTLED: Not enforceing rate shaping */
-	ARL_UNTHROTTLED
+	ARL_UNTHROTTLED,
+	/* IDLE: under light load and do nothing */
+	ARL_IDLE
 };
 
 enum arl_mode {
@@ -53,6 +55,7 @@ struct arl_vars {
 	s64	buffer;	/* Token bucket depth/rate */
 	s64	ts;	/* Last de-queue time */
 	ktime_t	phase_start_t;		/* phase start time */
+	unsigned long state_start_t;	/* state start time */
 	ktime_t	last_drain_t;		/* Timestamp of last DRAIN */
 	struct psched_ratecfg rate;	/* The current rate limit */
 	struct tc_ratespec cfg_rate;

@@ -115,7 +115,7 @@ static bool arl_is_latency_high(struct arl_sched_data *q)
 
 	/* consider latency is high if the short term smoothed latency is
 	 * significantly (>latency_hysteresis) higher than
-	 * max(ARL_LOW_LATENCY, lt_min_hrtt) and higher than the ARL parameter
+	 * max(ARL_LOW_LATENCY, lt_min_hrtt) or higher than the ARL parameter
 	 * "max_latency".
 	 */
 	if ((st_min_hrtt < q->params.latency_hysteresis +
@@ -127,14 +127,18 @@ static bool arl_is_latency_high(struct arl_sched_data *q)
 }
 
 /* Check if the bandwidth is fully used.
- * Return true if the measured throughput is above ~92% of the configured rate.
+ * Return true if the measured throughput is above ~92% or within 400 Kbits of
+ * the configured rate.
  */
 static bool arl_is_under_load(struct arl_sched_data *q)
 {
 	u32 rate = q->vars.current_rate;
 
-	return (q->vars.bw_est > (rate - ((rate * 10) >> ARL_SCALE))) ? true :
-		false;
+	if (q->vars.bw_est > (rate - ((rate * 10) >> ARL_SCALE)) ||
+	    q->vars.bw_est + 400 / 8 > rate)
+		return true;
+	else
+		return false;
 }
 
 static bool arl_is_throttling(struct arl_sched_data *q)
@@ -157,7 +161,7 @@ static bool arl_check_drain(struct arl_sched_data *q)
 	if (q->vars.state != ARL_LATENCY_PROBE && q->vars.state != ARL_STABLE)
 		return false;
 
-	/* No need to DRAIN if latency is low */
+	/* No need to DRAIN if the latency is low */
 	if (minmax_get(&q->vars.st_min_hrtt) < ARL_LOW_LATENCY)
 		return false;
 
@@ -205,6 +209,7 @@ static void arl_change_state(struct arl_sched_data *q, int new_state)
 	vars->phase = 0;
 	vars->cycle_cnt = 0;
 	vars->phase_start_t = ktime_get();
+	vars->state_start_t = jiffies;
 	vars->latency_trend = 0;
 	vars->rate_factor = ARL_BW_UNIT;
 
@@ -232,7 +237,7 @@ static void arl_change_state(struct arl_sched_data *q, int new_state)
 		bw = vars->last_stable_base_rate;
 		if (arl_is_latency_high(q))
 			vars->next_bw_probe_t = jiffies +
-						msecs_to_jiffies(60 *
+						msecs_to_jiffies(120 *
 								 MSEC_PER_SEC);
 	} else if (vars->state == ARL_BW_PROBE) {
 		/* Use the bw from previous cycle to avoid overshot */
@@ -244,21 +249,27 @@ static void arl_change_state(struct arl_sched_data *q, int new_state)
 		 * It is not needed for ingress mode as the measured BW should
 		 * be the actual available bandwidth.
 		 */
-		if (vars->state == ARL_UNTHROTTLED)
+		if (vars->state == ARL_UNTHROTTLED) {
 			bw -= (bw >> ARL_SCALE) * 5;
-		else if (time_after(jiffies, vars->last_latency_upd_t +
-				    msecs_to_jiffies(ARL_MT_WIN)) ||
-			 arl_is_latency_high(q))
-			bw -= (bw >> ARL_SCALE) * 2;
+			bw = min_t(u32, bw, vars->base_rate * 2);
+		} else {
+			bw = min_t(u32, bw, vars->base_rate);
+			if (arl_is_latency_high(q) ||
+			    time_after(jiffies, vars->last_latency_upd_t +
+				       msecs_to_jiffies(ARL_MT_WIN)))
+				bw -= (bw >> ARL_SCALE) * 2;
+		}
 	}
 	/* adjust for overshot */
-	bw -= (bw >> ARL_SCALE);
+	bw -= (2 * bw >> ARL_SCALE);
 
 	/* New base rate for next state */
-	vars->base_rate = max(bw, vars->base_rate);
+	if (new_state != ARL_DRAIN && new_state != ARL_LATENCY_PROBE)
+		vars->base_rate = max(bw, vars->base_rate);
 	vars->last_stable_base_rate = bw;
 
 	/* set rate for next cycle */
+	vars->target_rate = vars->base_rate;
 	switch (new_state) {
 	case  ARL_DRAIN:
 		vars->last_drain_t = ktime_get();
@@ -267,35 +278,35 @@ static void arl_change_state(struct arl_sched_data *q, int new_state)
 		vars->phase_dur = clamp(vars->phase_dur, ARL_DRAIN_DUR_MIN,
 					ARL_DRAIN_DUR_MAX);
 
-		vars->rate_delta = 5 * (vars->base_rate >> ARL_SCALE);
+		vars->target_rate -= 5 * (vars->base_rate >> ARL_SCALE);
 		if (arl_is_latency_high(q)) {
 			/* If latency is high, reduce the base rate to ~70%. so
 			 * a [-1, -1, -1, 0] cycle could eliminate ~90% of RTT
 			 * worth of queueing latency.
 			 */
-			vars->rate_delta = vars->base_rate - (vars->base_rate *
-					   ARL_DRAIN_GAIN >> ARL_SCALE);
+			vars->target_rate = (vars->base_rate *
+					     ARL_DRAIN_GAIN >> ARL_SCALE);
 			vars->base_rate -= 3 * (vars->base_rate >> ARL_SCALE);
 		}
 		break;
 
 	case ARL_BW_PROBE:
-		vars->rate_delta = (vars->base_rate * ARL_HIGH_GAIN
-				    >> ARL_SCALE) - vars->base_rate;
+		vars->target_rate = (vars->base_rate * ARL_HIGH_GAIN
+				     >> ARL_SCALE);
 		break;
 
 	case ARL_LATENCY_PROBE:
 		vars->base_rate -= (vars->base_rate >> ARL_SCALE);
-		vars->rate_delta = 5 * (vars->base_rate  >> ARL_SCALE);
+		vars->target_rate -= 5 * (vars->base_rate  >> ARL_SCALE);
 		break;
 
 	default:
-		vars->rate_delta = 0;
+		break;
 	}
 
 	vars->base_rate = max_t(u32, vars->base_rate, q->params.min_rate);
-	vars->target_rate = vars->base_rate;
 	vars->current_rate = vars->base_rate;
+	vars->rate_delta = abs(vars->target_rate - vars->base_rate);
 
 	vars->last_min_hrtt = minmax_get(&vars->st_min_hrtt);
 	vars->min_hrtt_last_cycle = vars->last_min_hrtt;
@@ -313,6 +324,7 @@ static void arl_update_phase(struct Qdisc *sch)
 	struct arl_vars *vars = &q->vars;
 	u64	next_rate;
 	int	latency;
+	u32	bw_avg;
 	bool	is_under_load, is_latency_high, is_latency_current,
 		is_throttling;
 
@@ -370,6 +382,7 @@ static void arl_update_phase(struct Qdisc *sch)
 		return;
 
 	arl_update_bw_estimate(q);
+	bw_avg = ewma_read(&vars->bw_avg);
 
 	/* If there is no recent latency, stop adjusting rates for Egress mode.
 	 * For ingress mode, the BW is still get updated based on the current
@@ -394,39 +407,38 @@ static void arl_update_phase(struct Qdisc *sch)
 
 	switch (vars->state) {
 	case ARL_STABLE:
-		if (!is_throttling) {
-			vars->last_drain_t = ktime_get();
-			vars->cycle_cnt = 0;
-			break;
+		if (vars->bw_est < q->params.min_rate && !is_under_load) {
+			arl_change_state(q, ARL_IDLE);
+			return;
 		}
 
 		if (q->params.mode == ARL_EGRESS) {
 			/* Exit stable state if latency increases under load */
-			if (is_latency_high || vars->latency_trend > 2) {
-				/* If it is not under load, defer a few cycles
-				 * before trying to reduce rate. it maybe just a
-				 * short term glitch or the bloat happened in
-				 * the ingress direction.
+			if (is_latency_high) {
+				/* Defer a few cycles before trying to reduce
+				 * the rate. It may be just a short glitch or
+				 * the bloated queue happened in the other
+				 * direction.
 				 */
 				if (is_under_load || vars->cycle_cnt > 3) {
 					arl_change_state(q, ARL_LATENCY_PROBE);
 					return;
 				}
-			} else if (vars->cycle_cnt > 5 &&
-				   time_after(jiffies, vars->next_bw_probe_t)) {
-				arl_change_state(q, ARL_BW_PROBE);
-				return;
+			} else if (is_under_load) {
+				if (vars->latency_trend == 0 &&
+				    vars->cycle_cnt > 5 &&
+				    time_after(jiffies,
+					       vars->next_bw_probe_t)) {
+					arl_change_state(q, ARL_BW_PROBE);
+					return;
+				}
+			} else {
+				vars->cycle_cnt = 0;
 			}
 			break;
 		}
 
-		/* INGRESS mode
-		 * If the ingress queue is building up when the
-		 * latency increase, then it operates in the
-		 * right direction. CoDel will do its work to
-		 * shrink the latency. Otherwise, the current
-		 * rate is too high and need be reduced.
-		 */
+		// INGRESS mode
 		if (is_latency_high) {
 			if (vars->latency_trend > 1) {
 				arl_change_state(q, ARL_LATENCY_PROBE);
@@ -435,28 +447,29 @@ static void arl_update_phase(struct Qdisc *sch)
 			break;
 		}
 
-		vars->current_rate = max_t(u32, vars->current_rate,
-					   ewma_read(&vars->bw_avg));
-
-		/* if the latency is low and the ingress queue builds up, then
-		 * the rate can be increased.
+		/* If the ingress queue is building up when the latency
+		 * increases, then it operates in the right direction. CoDel
+		 * will do its work to shrink the queue. Otherwise, the current
+		 * rate is too high and need be reduced.
 		 */
-		if (vars->latency_trend == 0) {
-			if (vars->cycle_cnt > 5 && ewma_read(&vars->bw_avg) >
-			    vars->base_rate &&
-			    time_after(jiffies, vars->next_bw_probe_t)) {
-				arl_change_state(q, ARL_BW_PROBE);
-				return;
-			}
+		if (!is_throttling) {
+			vars->last_drain_t = ktime_get();
+			vars->cycle_cnt = 0;
 			break;
 		}
-		vars->cycle_cnt = 0;
-		vars->current_rate = vars->base_rate -
-				     (vars->base_rate >>
-				      ARL_SCALE);
-		vars->current_rate = max_t(u32,
-					   vars->current_rate,
-					   ewma_read(&vars->bw_avg));
+		if (vars->latency_trend > 0 || !is_latency_current)
+			break;
+		/* Latency is low and the ingress queue is building up, the rate
+		 * can be increased to the bw observed.
+		 */
+		if (vars->cycle_cnt > 5 && bw_avg > vars->base_rate -
+		    2 * (vars->base_rate >> ARL_SCALE) &&
+		    time_after(jiffies, vars->next_bw_probe_t)) {
+			arl_change_state(q, ARL_BW_PROBE);
+			return;
+		}
+		bw_avg -= 2 * (bw_avg >> ARL_SCALE);
+		vars->current_rate = max_t(u32, vars->current_rate, bw_avg);
 		break;
 
 	case ARL_BW_PROBE:
@@ -478,11 +491,11 @@ static void arl_update_phase(struct Qdisc *sch)
 			 * to figure out the available BW quickly.
 			 */
 			if (vars->cycle_cnt > 9) {
-				if (vars->bw_est > vars->base_rate * 130 / 100)
+				if (vars->bw_est >
+				    vars->base_rate * 130 / 100) {
 					arl_change_state(q, ARL_UNTHROTTLED);
-				else
-					arl_change_state(q, ARL_STABLE);
-				return;
+					return;
+				}
 			}
 		} else {
 			if (vars->latency_trend > 0) {
@@ -510,7 +523,7 @@ static void arl_update_phase(struct Qdisc *sch)
 				return;
 			}
 			vars->current_rate = max_t(u32, vars->current_rate,
-						   ewma_read(&vars->bw_avg));
+						   bw_avg);
 			vars->target_rate = vars->current_rate;
 
 			/* Pause the rate_delta increase for one in every 3
@@ -518,24 +531,33 @@ static void arl_update_phase(struct Qdisc *sch)
 			 * be some lags between rate change and latency change.
 			 */
 			vars->rate_factor = ARL_BW_UNIT;
+			/* For ingress mode, stop increase rate for every cycles
+			 * and only increase rate based on observed bandwidth
+			 * increase.
+			 */
+			vars->rate_delta = 0;
 		} else {
 			/* Switch to high gain if latency is stable. */
 			vars->rate_factor = ARL_HIGH_GAIN;
 		}
 
-		/* Ingress Mode, rate is updated every cycle to the
+		/* Ingress Mode, the rate is updated every cycle to the
 		 * observed bandwidth.
 		 */
-		if (q->params.mode == ARL_INGRESS)
+		if (q->params.mode == ARL_INGRESS) {
 			vars->current_rate = max(vars->current_rate,
 						 vars->bw_est);
-		/* update rate for next cycle */
-		vars->target_rate = vars->target_rate *
-					vars->rate_factor >> ARL_SCALE;
-		vars->rate_delta = vars->target_rate -
-					vars->current_rate;
-		vars->rate_delta = min_t(u32, vars->rate_delta,
-					 vars->base_rate / 10);
+		} else {
+			/* update rate for next cycle */
+			vars->target_rate = max_t(u32, vars->target_rate,
+						  vars->current_rate);
+			vars->target_rate = vars->target_rate *
+						vars->rate_factor >> ARL_SCALE;
+			vars->rate_delta = vars->target_rate + 1 -
+					   vars->current_rate;
+			vars->rate_delta = min_t(u32, vars->rate_delta,
+						 vars->base_rate / 10);
+		}
 		break;
 
 	case ARL_LATENCY_PROBE:
@@ -558,27 +580,32 @@ static void arl_update_phase(struct Qdisc *sch)
 		if (vars->bw_est > q->params.min_rate && is_latency_current &&
 		    (minmax_get(&q->vars.st_min_hrtt) > q->params.max_latency &&
 		     vars->cycle_cnt > 2)) {
+			vars->base_rate -= 3 * (vars->base_rate >> ARL_SCALE);
 			arl_change_state(q, ARL_DRAIN);
 			return;
 		}
 
-		if (vars->latency_trend >= 0)
-			vars->rate_factor = ARL_HIGH_GAIN;
+		/* update rate for next cycle */
+		if (vars->latency_trend >= 0 || is_latency_high)
+			vars->rate_factor = ARL_DRAIN_GAIN;
 		else
 			vars->rate_factor = ARL_BW_UNIT;
 
-		// Increase rate adjustment for each cycle
-		vars->rate_delta = ((vars->rate_delta * vars->rate_factor)
-				    >> ARL_SCALE);
-		if (vars->rate_delta > vars->base_rate / 4)
-			vars->rate_delta = vars->base_rate / 4;
+		vars->target_rate = vars->target_rate *
+					vars->rate_factor >> ARL_SCALE;
+		vars->current_rate = clamp(vars->last_stable_base_rate,
+					   vars->target_rate, vars->base_rate);
 		break;
 
 	case ARL_DRAIN:
-		if (!is_latency_high || vars->bw_est < q->params.min_rate) {
+		if (!is_latency_high) {
 			arl_change_state(q, ARL_STABLE);
 			return;
 		}
+		vars->current_rate -= 5 * (vars->base_rate >> ARL_SCALE);
+		if (vars->last_stable_base_rate < vars->base_rate)
+			vars->base_rate = max(vars->last_stable_base_rate,
+					      vars->current_rate);
 		arl_change_state(q, ARL_LATENCY_PROBE);
 		return;
 
@@ -587,19 +614,26 @@ static void arl_update_phase(struct Qdisc *sch)
 		    vars->bw_est < q->params.min_rate)
 			break;
 
-		if (is_latency_high || vars->latency_trend > 1) {
-			if (vars->bw_est > vars->base_rate) {
-				arl_change_state(q, ARL_LATENCY_PROBE);
-				return;
-			}
+		if (is_latency_high || vars->latency_trend > 1 ||
+		    !is_latency_current || vars->cycle_cnt > 10 ||
+		    vars->bw_est > vars->base_rate * 2) {
 			arl_change_state(q, ARL_STABLE);
 			return;
 		}
+		break;
 
-		if (vars->bw_est > vars->base_rate &&
-		    (!is_latency_current || vars->cycle_cnt > 10)) {
+	case ARL_IDLE:
+		if (vars->bw_est > q->params.min_rate || is_under_load) {
 			arl_change_state(q, ARL_STABLE);
 			return;
+		}
+		/* Restore the default rate when it has been idle for 20
+		 * minutes.
+		 */
+		if (time_after(jiffies, vars->state_start_t + 20 * 60 * HZ)) {
+			if (vars->base_rate < q->params.rate)
+				vars->base_rate = q->params.rate;
+			arl_change_state(q, ARL_IDLE);
 		}
 		break;
 	}
@@ -1271,7 +1305,10 @@ static struct sk_buff *arl_dequeue(struct Qdisc *sch)
 			arl_dequeue_update(sch, skb);
 			return skb;
 		}
-		qdisc_watchdog_schedule_ns(&q->wtd, now + (-toks), true);
+		qdisc_watchdog_schedule_ns(&q->wtd, now +
+					   min_t(u32, (-toks), q->vars.buffer),
+					   true);
+
 		qdisc_qstats_overlimit(sch);
 	}
 	return NULL;
@@ -1315,7 +1352,7 @@ static int arl_change(struct Qdisc *sch, struct nlattr *opt)
 		q->params.buffer = nla_get_u32(tb[TCA_ARL_BUFFER])
 				   * NSEC_PER_USEC;
 
-	/* convert the max_bw to KBps */
+	/* Convert max_bw from Bps to KBps */
 	if (tb[TCA_ARL_MAX_BW])
 		q->params.max_bw = div_u64(nla_get_u64(tb[TCA_ARL_MAX_BW]),
 					   1000);
@@ -1327,8 +1364,8 @@ static int arl_change(struct Qdisc *sch, struct nlattr *opt)
 	if (tb[TCA_ARL_MODE])
 		q->params.mode = nla_get_u32(tb[TCA_ARL_MODE]);
 
-	/* Start ARL with 125% of min_rate */
-	q->params.rate = div_u64(q->params.min_rate * 125, 100);
+	/* The default config set the minimum rate to 70% of connection speed */
+	q->params.rate = div_u64(q->params.min_rate * 100, 70);
 
 	if (tb[TCA_ARL_LIMIT])
 		q->params.limit = nla_get_u32(tb[TCA_ARL_LIMIT]);
@@ -1527,10 +1564,6 @@ static int arl_dump_stats(struct Qdisc *sch, struct gnet_dump *d)
 	st.latency = minmax_get(&q->vars.min_hrtt);
 	st.state = q->vars.state;
 	st.current_bw = q->vars.bw_est * 8;
-
-	/* clear max_bw and min_rate after each stats dump */
-	q->stats.max_bw = 0;
-	q->stats.min_rate = 0;
 
 	return gnet_stats_copy_app(d, &st, sizeof(st));
 }
